@@ -647,7 +647,9 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
     def set_input_embeddings(self, value: nn.Module):
         self.conv1 = value
 
-    def _prepare_attention_mask(self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def _prepare_attention_mask(
+        self, inputs_tensor: torch.Tensor, cu_seqlens: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         # Flash Attention 2 doesn't need a 4D mask and relies on `cu_seqlens/max_seqlen`
         # NOTE: the created attention masl only approximates the ragged FA2 attention by
         # allowing bidirectional attention within `cu_seqlens` blocks, and not attending between
@@ -725,11 +727,13 @@ class Qwen3ASRAudioEncoder(Qwen3ASRPreTrainedModel):
             if remainder != 0:
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+        attention_mask = self._prepare_attention_mask(hidden_states, cu_seqlens)
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
+                attention_mask=attention_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -1192,16 +1196,18 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             feature_attention_mask (`torch.LongTensor`, *optional*):
                 Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
-                The length of feature shape of each audio in LLM.
+                The valid Mel-frame length of each audio. Required when `feature_attention_mask` is not provided.
             return_per_audio (`bool`, *optional*):
                 If True, also return the list of per-audio encoder outputs `[(T_i, D), ...]`
                 (used by the CTC branch which needs variable-length features per audio).
         """
         if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            feature_lens = torch.sum(feature_attention_mask, dim=1)
+        elif audio_feature_lengths is not None:
+            feature_lens = audio_feature_lengths
         else:
-            audio_feature_lengths = None
-        feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
+            raise ValueError("Either feature_attention_mask or audio_feature_lengths must be provided.")
+        feature_lens = feature_lens.to(device=input_features.device, dtype=torch.long)
     
         # audio encoder do not support batch inference to keep precision
         audio_features = []
@@ -1272,8 +1278,7 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             offset += L
         log_probs = F.log_softmax(padded.float(), dim=-1).transpose(0, 1)  # (T, B, V)
         ctc_label_lengths = ctc_label_lengths.to(device=device, dtype=torch.long)
-        # 保护: 输入帧长必须 >= 标签长度, 否则该样本 CTC 无解 (置 inf, zero_infinity 会归零)
-        input_lengths = torch.maximum(input_lengths, ctc_label_lengths)
+        # 保留真实帧长；无法对齐的样本由 zero_infinity 归零，不能把 padding 帧当作有效输入。
         loss = F.ctc_loss(
             log_probs,
             ctc_labels.to(device),
@@ -1566,22 +1571,15 @@ class Qwen3ASRForConditionalGeneration(Qwen3ASRPreTrainedModel, GenerationMixin)
         eos_token_id: list = [151643, 151645],
         **kwargs,
     ):
-        thinker_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "eos_token_id": eos_token_id,
-            "num_beams": num_beams,
-            "repetition_penalty": repetition_penalty
-        }
-        for key, value in kwargs.items():
-            # Process special input values
-            if key == "feature_attention_mask":
-                thinker_kwargs[key] = value
-            elif key in ("input_features", "attention_mask"):
-                thinker_kwargs[key] = value
-                
-        thinker_result = self.thinker.generate(input_ids=input_ids, return_dict_in_generate=True, **thinker_kwargs)
-
-        return thinker_result
+        kwargs.setdefault("return_dict_in_generate", True)
+        return self.thinker.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            **kwargs,
+        )
 
 
 __all__ = [
