@@ -1,9 +1,32 @@
-# Qwen3-ASR Context Deploy (`qwen3_asr_context_deploy`) — Qwen3-ASR 热词定制推理
+<div align="center">
 
-基于 **Qwen3-ASR** 的语音识别推理部署包，核心能力是 **检索式热词定制（CTC + 音素 RAG）**：
-先用挂在冻结编码器之上的轻量 CTC 分支贪婪解码出「粗转写」，再用音素相似度从大热词库检索出
-真正相关的少量热词，注入主模型 `system` 后正式转写。相比「全量热词硬注入」，该方案在大幅提升
-命名实体 / 罕见词召回的同时，还把整体 CER 压到最低（见文末[实验结果](#实验结果)）。
+# Qwen3-ASR Context Deploy
+
+**用 CTC 粗转写与音素检索，为 Qwen3-ASR 提供可扩展的热词上下文**
+
+`Qwen3-ASR` · `CTC` · `Phoneme RAG` · `vLLM` · `ms-swift`
+
+[快速开始](#快速开始) · [vLLM 推理](#全流程-vllm-后端) · [模型训练](docs/ms_swift_aishell.md) · [实验结果](#实验结果)
+
+</div>
+
+基于 [Qwen3-ASR Context Deploy 原项目](https://github.com/Xiaoxx18/qwen3_asr_context_deploy)，
+本仓库支持从外置词表检索相关候选词，再将候选词提供给 ASR 模型，帮助识别专名和罕见词。
+同时提供 vLLM 推理适配，以及从 Qwen3-ASR-0.6B 出发的两阶段训练和导出流程。
+
+```mermaid
+flowchart LR
+    A[音频] --> B[音频编码器]
+    B --> C[CTC 粗转写]
+    C --> D[音素检索]
+    W[外置热词表] --> D
+    D --> E[候选热词提示]
+    B --> F[Qwen3-ASR 解码]
+    E --> F
+    F --> G[最终转写]
+```
+
+> **验证范围**：原作者报告了下方的热词评测结果。本仓库已验证 0.6B 两阶段各 2 步的训练、导出和 vLLM 推理短流程；尚未完成 AISHELL-1 全量训练或验证其识别效果。
 
 ## 特性
 
@@ -13,6 +36,10 @@
 - **批量评测**：文件推理模式直接读 jsonl 批量转写并计算 CER。
 
 ## 环境依赖
+
+从官方 **Qwen3-ASR-0.6B** 开始训练热词模型、训练 CTC 分支并导出到 vLLM 的步骤见
+[ms-swift + AISHELL-1 训练说明](docs/ms_swift_aishell.md)。SeACo 提供的是 dev/test 评测子集；
+训练使用 AISHELL-1 官方 train 划分，并通过本项目的 ms-swift external plugin 加载自定义 CTC 模型。
 
 - Python 3.11+
 - `torch`（GPU）、`transformers`、`qwen_omni_utils`、`flash-attn`（`flash_attention_2`）
@@ -46,20 +73,20 @@ path = snapshot_download("habagou/qwen3-asr-hotword-1.7B-ctc")
 
 ## 快速开始
 
-配置集中在 `infer_ctc.py` 顶部，也可用环境变量覆盖：
+以下是 Transformers 推理入口。配置集中在 `infer_ctc.py` 顶部；其中 `MODEL_PATH`、`MODE`、`TEST_JSON`、`OUT_JSON` 可用环境变量覆盖：
 
 | 变量 | 说明 |
 |---|---|
 | `MODEL_PATH` | 权重路径（`ctc`/`ctc_rag` 需带 CTC 分支） |
 | `MODE` | `asr` \| `ctc` \| `ctc_rag` |
-| `HOT_TXT` | `ctc_rag` 的大热词库（默认 `hotword/hot.txt`） |
-| `RAG_THRESHOLD` | 音素相似度阈值（默认 0.85） |
-| `MAX_CTX_HOTWORDS` | 每条最多注入的检索热词数（默认 10） |
+| `HOT_TXT` | `ctc_rag` 的大热词库（默认 `hotword/hot.txt`，需修改脚本配置） |
+| `RAG_THRESHOLD` | 音素相似度阈值（默认 0.85，需修改脚本配置） |
+| `MAX_CTX_HOTWORDS` | 每条最多注入的检索热词数（默认 10，需修改脚本配置） |
 | `TEST_JSON` | 批量推理的 jsonl 路径（留空 = 单条样本模式） |
 | `OUT_JSON` | 结果输出路径（留空自动放 `TEST_JSON` 同目录） |
 
 ```bash
-# 单条样本（按文件顶部 wav_path）
+# 单条样本（先填写文件末尾的 wav_path）
 python infer_ctc.py
 
 # 批量推理 jsonl 并计算 CER
@@ -85,6 +112,86 @@ vocab = _get_vocab()        # ctc / ctc_rag 需要
 pc = _load_corrector()      # 仅 ctc_rag 需要
 out = transcribe(model, processor, "/path/to/x.wav", mode="ctc_rag", vocab=vocab, pc=pc)
 print(out["text"])          # ctc_rag 还含 out["rough"]（CTC 粗转写）/ out["hotwords"]（检索热词）
+```
+
+## 全流程 vLLM 后端
+
+新增 `infer_vllm.py` / `qwen3_asr_vllm`，直接加载**带 CTC 分支的完整 checkpoint**，不需要删除
+`thinker.ctc_branch.*`，也不启动 Transformers 推理模型。音频编码器、CTC 分支和文本解码器
+均由同一个 vLLM worker 持有，音素 RAG 也在该 worker 内运行。
+
+```text
+vLLM worker: Mel → 音频编码器 → CTC → 音素 RAG → 热词提示
+                           └→ 编码特征 ─────────→ vLLM 最终生成
+```
+
+准备阶段通过命名的 `LLM.collective_rpc()` worker 扩展执行；最终通过 `LLM.generate()` 传入预计算音频 embedding。
+RPC 仅传输数据，不需要开启 vLLM 的不安全 pickle 序列化选项。
+生成阶段跳过音频编码器，因此每条音频只编码一次。当前跨进程传递会将编码特征复制到 CPU，
+再由 vLLM 送回 GPU；这部分传输有开销，但不会重新编码，也不会再次提取 Mel。
+
+当前适配固定 **vLLM 0.22.1 / Transformers 4.57.6**，支持单 GPU、未量化的合并权重，提供
+`asr` / `ctc` / `ctc_rag` 三种模式和 JSONL 批量推理。暂不支持 TP/PP、多模态混合请求或 LoRA
+adapter 直接加载。默认单段音频上限 30 秒，超长音频先切段；可通过 `--max-audio-seconds` 调整。
+批量推理逐条准备音频上下文，再将最终文本解码交给 vLLM 批量调度。
+基座模型输出的 `language …<asr_text>` 前缀会自动剥离；带参考文本的 JSONL 推理会输出
+去除空白和标点后的整体 CER（总编辑距离 / 总参考字符数）。
+
+使用独立的 Python 3.10+ 环境安装，避免改变原有 HF 环境：
+
+```bash
+python -m pip install -e '.[vllm]'
+```
+
+vLLM/PyTorch 的 CUDA 构建需与本机驱动匹配。CUDA 12 环境可以先安装官方
+[vLLM 0.22.1 cu129 wheel](https://github.com/vllm-project/vllm/releases/tag/v0.22.1)
+及兼容的 PyTorch CUDA 12 构建，再执行上述安装命令。
+本入口使用贪婪解码，可设置 `VLLM_USE_FLASHINFER_SAMPLER=0` 使用 vLLM 内置采样路径，
+跳过启动时 FlashInfer 采样器的 JIT 编译。
+
+```bash
+# 热词检索 + 最终转写，检查每条音频恰好编码一次
+CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
+  --model /path/to/ctc-checkpoint --audio /path/to/example.wav \
+  --mode ctc_rag --hot-txt hotword/hot.txt --verify-encoder-reuse
+
+# 只跑 CTC（仍由 vLLM worker 执行）
+CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
+  --model /path/to/ctc-checkpoint --audio /path/to/example.wav --mode ctc
+
+# 批量推理，输入格式与原入口相同，输出含 ref/text/rough/hotwords
+CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
+  --model /path/to/ctc-checkpoint --test-json /path/to/test.jsonl \
+  --mode ctc_rag --batch-size 8 --out-json /path/to/results.jsonl
+```
+
+也可以作为库调用；使用 `if __name__ == '__main__'` 保护 vLLM 的 worker 启动：
+
+```python
+from qwen3_asr_vllm import VLLMContextASR
+
+if __name__ == '__main__':
+    engine = VLLMContextASR('/path/to/ctc-checkpoint', mode='ctc_rag')
+    print(engine.transcribe('/path/to/example.wav'))
+    # ndarray 输入须为 16 kHz、单声道 float32；文件输入自动转单声道并重采样。
+```
+
+模型插件通过 `pip install -e` 注册到 `vllm.general_plugins`，保证子进程能够发现自定义架构。
+`vllm serve` 本身不会运行两阶段上下文准备；完整热词流程使用本项目的新入口。
+
+已使用 `habagou/qwen3-asr-hotword-1.7B-ctc` 的真实权重在 NVIDIA A800 上验证，测试环境为
+Python 3.10、PyTorch 2.11.0+cu128、vLLM 0.22.1+cu129、BF16。GPU 回归测试逐项核对了全部
+84 个 CTC 权重张量（包含 Q/K/V 合并），覆盖热词命中后的最终生成和不同音频长度的批量请求；
+每条音频的编码器调用次数均为 1。默认 `torch.compile` 和 CUDA Graph 推理路径也已完成单条验证。
+
+```bash
+# 普通回归测试；没有配置真实权重时跳过 GPU 集成测试
+python -m unittest discover -s tests -v
+
+# 在已安装 vLLM 的环境中执行真实权重 GPU 集成测试
+CUDA_VISIBLE_DEVICES=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
+  VLLM_TEST_MODEL=/path/to/ctc-checkpoint VLLM_TEST_AUDIO=/path/to/mandarin.wav \
+  python -m unittest discover -s tests -p test_vllm_integration.py -v
 ```
 
 ## 三种模式
@@ -117,8 +224,7 @@ Qwen3-ASR 的 HF 自定义实现：音频编码器 + 文本解码器（thinker�
 
 ## 实验结果
 
-> 以下结果来自 SeACo-Paraformer 风格的 Qwen3-ASR 热词定制评测（Aishell-1 命名实体子集），
-> 复现自 [SeACo-Paraformer](https://github.com/R1ckShi/SeACo-Paraformer.git) 论文中的测试集与评测方法。
+> 以下为原项目作者报告的结果，使用 SeACo-Paraformer 风格的 Qwen3-ASR 热词定制评测（AISHELL-1 命名实体子集）和 [SeACo-Paraformer](https://github.com/R1ckShi/SeACo-Paraformer.git) 的测试集与评测方法。它们不是本仓库 0.6B 短流程训练的实测结果。
 
 **评测数据**
 
@@ -166,6 +272,7 @@ Qwen3-ASR 的 HF 自定义实现：音频编码器 + 文本解码器（thinker�
 ## ContextASR-Bench 评测结果（Speech-Mandarin）
 
 在 [ContextASR-Bench](https://github.com/MrSupW/ContextASR-Bench) 的 **ContextASR-Speech / Mandarin** 子集（**15498** 条，覆盖 10+ 领域、大量命名实体）上评测同一权重 **qwen3-asr-hot 1.7B**。
+以下数据同样来自原项目作者报告，并非本仓库 0.6B 短流程的测量结果。
 论文要求单段音频 ≤30s，故先用 FunASR `fsmn-vad` 做端点检测并贪心合并到 ≤30s（15498 条 → 47908 chunk，平均 3.09 chunk/条），逐段转写后拼接。
 
 - **Contextless**：`system` 为空的纯转写基线。
@@ -201,7 +308,9 @@ Qwen3-ASR 的 HF 自定义实现：音频编码器 + 文本解码器（thinker�
 
 ## 致谢 / Acknowledgements
 
-本项目建立在多个优秀工作之上，特此致谢：
+本仓库基于 [Xiaoxx18/qwen3_asr_context_deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy)，感谢原作者提供模型、检索方案和评测结果。原仓库目前未附带许可证；使用和再分发相关代码前请确认权利许可。各依赖、数据集与模型权重分别遵循其各自的使用条款。
+
+本项目还建立在多个优秀工作之上，特此致谢：
 
 - [Qwen3-ASR](https://github.com/QwenLM/Qwen3) — 提供强大的多模态语音识别基座模型与训练框架。
 - [SeACo-Paraformer](https://github.com/R1ckShi/SeACo-Paraformer) — 检索式热词定制的评测集、评测口径与思路来源。
