@@ -5,9 +5,11 @@ from unittest.mock import Mock, patch
 import torch
 from torch.nn import functional as F
 
-from qwen3_asr_model.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig
+from qwen3_asr_model.configuration_qwen3_asr import Qwen3ASRAudioEncoderConfig, Qwen3ASRThinkerConfig
 from qwen3_asr_model.modeling_qwen3_asr import (
     Qwen3ASRAudioEncoder,
+    Qwen3ASRAudioEncoderLayer,
+    Qwen3ASRCTCBranch,
     Qwen3ASRForConditionalGeneration,
     Qwen3ASRThinkerForConditionalGeneration,
 )
@@ -161,6 +163,46 @@ class GenerationTest(unittest.TestCase):
         )
         self.assertIs(result, sequences)
         self.assertFalse(delegated.call_args.kwargs["return_dict_in_generate"])
+
+
+class CTCDropoutTest(unittest.TestCase):
+    @staticmethod
+    def make_config(dropout, backend):
+        config = Qwen3ASRThinkerConfig(
+            audio_config={"d_model": 8, "output_dim": 8, "encoder_attention_heads": 2,
+                          "encoder_ffn_dim": 16},
+            ctc_num_layers=1, ctc_num_heads=2, ctc_ffn_dim=16, ctc_vocab_size=10,
+            ctc_dropout=dropout,
+        )
+        config.audio_config._attn_implementation = backend
+        return config
+
+    @torch.no_grad()
+    def test_ctc_dropout_applies_in_training_and_is_disabled_in_eval(self):
+        features = torch.randn(12, 8)
+        lengths = torch.tensor([0, 12], dtype=torch.int32)
+        for backend in ("eager", "sdpa"):
+            with self.subTest(backend=backend):
+                branch = Qwen3ASRCTCBranch(self.make_config(0.8, backend))
+                mask = branch.build_attention_mask(features, lengths)
+                branch.train()
+                first = branch(features, lengths, attention_mask=mask)
+                second = branch(features, lengths, attention_mask=mask)
+                self.assertFalse(torch.equal(first, second))
+                branch.eval()
+                torch.testing.assert_close(
+                    branch(features, lengths, attention_mask=mask),
+                    branch(features, lengths, attention_mask=mask), rtol=0, atol=0,
+                )
+
+    @torch.no_grad()
+    def test_pretrained_audio_layer_keeps_original_no_dropout_behavior(self):
+        config = self.make_config(0.8, "eager").audio_config
+        config.dropout = config.attention_dropout = config.activation_dropout = 0.8
+        layer = Qwen3ASRAudioEncoderLayer(config).train()
+        features = torch.randn(12, 8)
+        lengths = torch.tensor([0, 12], dtype=torch.int32)
+        torch.testing.assert_close(layer(features, lengths)[0], layer(features, lengths)[0], rtol=0, atol=0)
 
 
 class AudioAttentionTest(unittest.TestCase):

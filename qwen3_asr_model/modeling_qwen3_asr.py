@@ -452,7 +452,7 @@ class Qwen3ASRPreTrainedModelForConditionalGeneration(Qwen3ASRPreTrainedModel):
 class Qwen3ASRAudioAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, enable_dropout: bool = False):
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
@@ -467,7 +467,9 @@ class Qwen3ASRAudioAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
         self.scaling = self.head_dim**-0.5
-        self.attention_dropout = 0.0
+        # The pretrained audio tower keeps its original no-dropout behavior.
+        # CTC layers explicitly opt in to their separately configured dropout.
+        self.attention_dropout = config.attention_dropout if enable_dropout else 0.0
         self.is_decoder = False
         self.is_causal = False
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
@@ -522,14 +524,14 @@ class Qwen3ASRAudioAttention(nn.Module):
 
 
 class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3ASRAudioEncoderConfig):
+    def __init__(self, config: Qwen3ASRAudioEncoderConfig, enable_dropout: bool = False):
         super().__init__()
         self.embed_dim = config.d_model
-        self.self_attn = Qwen3ASRAudioAttention(config)
+        self.self_attn = Qwen3ASRAudioAttention(config, enable_dropout=enable_dropout)
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.dropout = config.dropout
+        self.dropout = config.dropout if enable_dropout else 0.0
         self.activation_fn = ACT2FN[config.activation_function]
-        self.activation_dropout = config.activation_dropout
+        self.activation_dropout = config.activation_dropout if enable_dropout else 0.0
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
@@ -560,13 +562,14 @@ class Qwen3ASRAudioEncoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual + F.dropout(hidden_states, p=self.dropout, training=self.training)
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
+        hidden_states = F.dropout(hidden_states, p=self.activation_dropout, training=self.training)
         hidden_states = self.fc2(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + F.dropout(hidden_states, p=self.dropout, training=self.training)
 
         if hidden_states.dtype == torch.float16:
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
@@ -1097,7 +1100,7 @@ class Qwen3ASRCTCBranch(nn.Module):
         self._attn_implementation = layer_config._attn_implementation
 
         self.layers = nn.ModuleList(
-            [Qwen3ASRAudioEncoderLayer(layer_config) for _ in range(config.ctc_num_layers)]
+            [Qwen3ASRAudioEncoderLayer(layer_config, enable_dropout=True) for _ in range(config.ctc_num_layers)]
         )
         # 强制非因果: CTC 声学建模必须能看到整句左右上下文。显式关掉每层 self-attn 的
         # 因果标志, 不依赖底层默认值; forward 也只会构造块内双向掩码 (绝不传因果掩码)。
