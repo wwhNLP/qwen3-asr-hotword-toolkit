@@ -202,11 +202,11 @@ class FastRAG:
         return [(hw, score, end_pos) for (hw, _), (score, end_pos) in final.items()]
 
     def _python_distance_simple(self, main_list: List[int], sub_list: List[int]) -> Tuple[float, int]:
-        """局部扫描专用的简化版编辑距离，不需要 curr[0]=0 的逻辑"""
+        """编辑距离匹配子串，允许免费跳过局部窗口中的前缀。"""
         n = len(sub_list)
         m = len(main_list)
         
-        # 局部窗口已经对齐起始，所以使用标准编辑距离初始化
+        # 锚点只给出近似起点；窗口可包含目标前面的其他音素。
         prev = [float(i) for i in range(n + 1)]
         curr = [0.0] * (n + 1)
         
@@ -214,7 +214,7 @@ class FastRAG:
         best_pos = 0
         
         for j in range(1, m + 1):
-            curr[0] = float(j) # 标准编辑距离，左边是插入成本
+            curr[0] = 0.0
             m_val = main_list[j-1]
             for i in range(1, n + 1):
                 cost = 0.0 if sub_list[i-1] == m_val else 1.0
