@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🎙️ Qwen3-ASR Context Deploy
+# 🎙️ Qwen3-ASR Hotword vLLM
 
 **Hotword-aware speech recognition with CTC, phoneme retrieval, and vLLM**
 
@@ -34,8 +34,8 @@ flowchart LR
 Use a separate Python 3.10+ GPU environment. The vLLM adapter targets **vLLM 0.22.1** and **Transformers 4.57.6**; install CUDA-compatible vLLM and PyTorch builds for your system.
 
 ```bash
-git clone https://github.com/wwhNLP/qwen3-asr-context-deploy.git
-cd qwen3-asr-context-deploy
+git clone https://github.com/wwhNLP/qwen3-asr-hotword-vllm.git
+cd qwen3-asr-hotword-vllm
 python -m pip install -e '.[vllm]'
 ```
 
@@ -73,7 +73,7 @@ The original Transformers entry point is `infer_ctc.py`; configure its hotword s
 
 The [ms-swift + AISHELL-1 guide](docs/ms_swift_aishell.md) (Chinese) covers data preparation, hotword-aware SFT, CTC-only training, checkpoint export, and vLLM inference. It starts from the official Qwen3-ASR-0.6B base model. Use AISHELL-1 **train** for training and reserve the SeACo dev/test subsets for evaluation.
 
-The 0.6B training → export → vLLM pipeline was smoke-tested for **two steps per training stage**; full AISHELL-1 training and resulting recognition quality have not been validated. The [upstream README](https://github.com/Xiaoxx18/qwen3_asr_context_deploy#readme) contains the original author's benchmark results, which are not results from this fork's 0.6B smoke test.
+The 0.6B training → export → vLLM pipeline was smoke-tested for **two steps per training stage**; full AISHELL-1 training and resulting recognition quality have not been validated. The [upstream README](https://github.com/Xiaoxx18/qwen3_asr_context_deploy#readme) contains the original author's benchmark results, which are not results from this repository's 0.6B smoke test.
 
 ## 🧪 Tests
 
