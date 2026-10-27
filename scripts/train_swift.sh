@@ -15,6 +15,7 @@ options=(
   --tuner_type full --use_hf true --torch_dtype float32 --bf16 true --fp16 false --attn_impl sdpa
   --dataset "${data_dir}/train_${stage}.jsonl"
   --val_dataset "${data_dir}/dev_${stage}.jsonl" --split_dataset_ratio 0
+  --strict true
   --per_device_train_batch_size 1 --per_device_eval_batch_size 1
   --gradient_accumulation_steps 16 --max_length 2048
   --padding_free false --packing false --loss_scale default
