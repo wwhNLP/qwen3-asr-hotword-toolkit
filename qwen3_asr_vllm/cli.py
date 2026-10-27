@@ -60,6 +60,15 @@ def main(argv=None):
         parser.error("--model or MODEL_PATH is required.")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive.")
+    out_path = args.out_json
+    if out_path is None and args.test_json:
+        out_path = args.test_json.with_name(f"{args.test_json.stem}_{args.mode}_vllm.jsonl")
+    if args.test_json and out_path:
+        same_path = args.test_json.resolve() == out_path.resolve()
+        if not same_path and args.test_json.exists() and out_path.exists():
+            same_path = args.test_json.samefile(out_path)
+        if same_path:
+            parser.error("--out-json must not refer to the --test-json input file.")
     engine = VLLMContextASR(
         args.model,
         mode=args.mode,
@@ -75,9 +84,6 @@ def main(argv=None):
         enforce_eager=args.enforce_eager,
     )
     samples = iter([{"wav": str(args.audio), "uttid": args.audio.stem, "ref": None}]) if args.audio else iter_samples(args.test_json)
-    out_path = args.out_json
-    if out_path is None and args.test_json:
-        out_path = args.test_json.with_name(f"{args.test_json.stem}_{args.mode}_vllm.jsonl")
     stream = out_path.open("w", encoding="utf-8") if out_path else None
     before = engine.runtime_stats()["encoder_forward_calls"] if args.verify_encoder_reuse else None
     total = 0
