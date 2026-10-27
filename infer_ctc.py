@@ -11,12 +11,11 @@
 """
 import os
 import sys
-
-os.environ.setdefault('CUDA_VISIBLE_DEVICES', "6")
 import warnings
 
 import torch
 from qwen_omni_utils import process_mm_info
+from utils.asr_metrics import transcript_text
 
 # ============================ 配置 ============================
 MODEL_PATH = os.environ.get("MODEL_PATH", "")
@@ -92,7 +91,7 @@ def generate_asr(model, processor, wav_path, hotwords=None, use_audio_in_video=T
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
-    return response_text
+    return transcript_text(response_text)
 
 
 @torch.no_grad()
@@ -176,17 +175,17 @@ def asr_from_audio(model, processor, wav_path, audio_cat, hotwords=None,
         return_dict_in_generate=True,
     )
     # 传 inputs_embeds 时, generate 返回的 sequences 仅含新生成 token
-    return processor.batch_decode(
+    return transcript_text(processor.batch_decode(
         result.sequences, skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
-    )[0]
+    )[0])
 
 
 def retrieve_hotwords(pc, rough_text, max_n=MAX_CTX_HOTWORDS):
     """用粗转写做音素 RAG 检索, 返回去重后的相关热词列表。"""
-    if not rough_text:
+    if not rough_text or max_n <= 0:
         return []
-    result = pc.correct(rough_text)
+    result = pc.correct(rough_text, k=max_n)
     ordered = []
     # matches: 命中并被替换的热词 (高置信); similars: top-k 相似候选
     for _origin, hotword, _score in list(result.matches) + list(result.similars):
@@ -255,7 +254,7 @@ _PUNCT_RE = re.compile(
 
 
 def _norm_cer(s):
-    return _PUNCT_RE.sub("", s or "")
+    return _PUNCT_RE.sub("", transcript_text(s or ""))
 
 
 def _edit_distance(ref, hyp):
@@ -300,6 +299,13 @@ def run_file(model, processor, test_json, *, mode=MODE, vocab=None, pc=None,
              out_json="", use_audio_in_video=True):
     """批量推理 jsonl 文件, 逐条写结果并计算整体 CER。"""
     out_json = out_json or _default_out_json(test_json, mode)
+    # Resolve symlinks and also catch distinct hard links to the same inode.
+    from pathlib import Path
+    input_path, output_path = Path(test_json), Path(out_json)
+    if input_path.resolve() == output_path.resolve() or (
+        input_path.exists() and output_path.exists() and os.path.samefile(input_path, output_path)
+    ):
+        raise ValueError("Input and output JSONL must be different files.")
     total_err = total_ref = n = 0
     t0 = time.time()
     print(f"[file] 推理 {test_json}\n[file] mode={mode}  "
