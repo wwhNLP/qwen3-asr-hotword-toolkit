@@ -100,10 +100,11 @@ class PhonemeCorrector:
         logger.debug(f"PhonemeCorrector 已更新 {len(new_hotwords)} 个热词，耗时 {time.time() - start_time:.3f}s")
         return len(new_hotwords)
 
-    def _find_matches(self, text: str, fast_results: List, input_processed: List[Tuple]) -> Tuple[List[MatchResult], List[Tuple[str, str, float]]]:
+    def _find_matches(self, text: str, fast_results: List, input_processed: List[Tuple], blacklist_window: int) -> Tuple[List[MatchResult], List[Tuple[str, str, float]]]:
         """精细匹配逻辑：边界约束的模糊搜索"""
         matches = []
         similars = []
+        tokens = self._tokenize_semantic_words(text)
         
         # 按 target 收集所有出现位置（同一热词可能在多个位置匹配）
         seen_targets = {}  # {hw: [pos1, pos2, ...]}
@@ -150,7 +151,7 @@ class PhonemeCorrector:
                             matches.append(res)
 
                         # 所有超过相似度阈值的都记入 similars（用于提示）
-                        if score >= self.similar_threshold:
+                        if score >= self.similar_threshold and not self._is_blacklisted(text, res, tokens, blacklist_window):
                             similars.append((origin_val, hw, score))
 
         # 潜在热词去重与排序 (不再简单按 seen_hw 排重，而是按分数和覆盖范围排序)
@@ -288,10 +289,10 @@ class PhonemeCorrector:
                 raise
 
             # 精筛
-            matches, similars = self._find_matches(text, fast_results, input_processed)
+            matches, similars = self._find_matches(text, fast_results, input_processed, window)
 
-        # 3. 冲突解决与替换
-        new_text, final_hw_info, all_hw_info = self._resolve_and_replace(text, matches, window)
+            # Keep the same hotword/blacklist snapshot for matching and replacement.
+            new_text, final_hw_info, _ = self._resolve_and_replace(text, matches, window)
         
         # similars 已经是 [(origin, hw, score), ...] 的元组列表
         return CorrectionResult(text=new_text, matches=final_hw_info, similars=similars[:k])

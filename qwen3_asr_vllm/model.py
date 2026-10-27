@@ -208,7 +208,7 @@ class Qwen3ASRContextForConditionalGeneration(Qwen3ASRForConditionalGeneration):
                 frame_ids = self.ctc_branch(audio_embeds, cu_seqlens).argmax(-1).tolist()
                 rough = self._context_vocab.ctc_greedy_decode(frame_ids)
         if mode == "ctc_rag":
-            result = self._context_corrector.correct(rough)
+            result = self._context_corrector.correct(rough, k=self._max_ctx_hotwords)
             hotwords = select_hotwords(result, self._max_ctx_hotwords)
         system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""
         messages = [
