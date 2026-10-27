@@ -8,7 +8,7 @@
 
 </div>
 
-A fork of [Xiaoxx18/qwen3_asr_context_deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy), adding a vLLM backend and a two-stage ms-swift training workflow. Given an external hotword list, it retrieves candidates using a CTC rough transcript and supplies them to Qwen3-ASR for final transcription.
+Based on [Xiaoxx18/qwen3_asr_context_deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy), this independent repository adds a vLLM backend and a two-stage ms-swift training workflow. Given an external hotword list, it retrieves candidates using a CTC rough transcript and supplies them to Qwen3-ASR for final transcription.
 
 ```mermaid
 flowchart LR
@@ -34,8 +34,8 @@ flowchart LR
 Use a separate Python 3.10+ GPU environment. The vLLM adapter targets **vLLM 0.22.1** and **Transformers 4.57.6**; install CUDA-compatible vLLM and PyTorch builds for your system.
 
 ```bash
-git clone https://github.com/wwhNLP/qwen3_asr_context_deploy.git
-cd qwen3_asr_context_deploy
+git clone https://github.com/wwhNLP/qwen3-asr-context-deploy.git
+cd qwen3-asr-context-deploy
 python -m pip install -e '.[vllm]'
 ```
 
