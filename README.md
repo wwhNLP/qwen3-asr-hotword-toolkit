@@ -10,9 +10,9 @@
 
 ## 💡 Background
 
-Speech recognition can struggle with names and domain-specific terms. An external hotword list can provide useful context, but putting a large list into every prompt adds irrelevant candidates and increases prompt length.
+Qwen3-ASR can struggle with names and domain-specific terms, and providing hotwords in the prompt alone may not reliably improve their recognition. This project explores hotword-aware fine-tuning and retrieval to make better use of an external vocabulary.
 
-The original [Qwen3-ASR Context Deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy) addresses this with a CTC branch and phoneme-based retrieval: it creates a rough transcript, selects relevant terms from a hotword list, and supplies them to Qwen3-ASR for final transcription.
+The original [Qwen3-ASR Context Deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy) combines a hotword-fine-tuned model with a CTC branch and phoneme-based retrieval: it creates a rough transcript, selects relevant terms from a hotword list, and supplies them to Qwen3-ASR for final transcription.
 
 This repository builds on that work with:
 
