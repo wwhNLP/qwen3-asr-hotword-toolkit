@@ -29,7 +29,7 @@ python -m pip install -e . --no-deps
 
 - `training/prepare_aishell.py`：按官方划分转换数据并构造训练热词。
 - `training/swift_plugin.py`：注册本项目模型、音频模板和 CTC 标签/loss。
-- `scripts/train_swift.sh`：两个阶段的单卡训练入口，可通过额外参数覆盖默认值。
+- `scripts/train_swift.sh`：两个阶段的训练入口，可通过额外参数覆盖默认值。
 - `training/export_checkpoint.py`：完整权重检查和推理导出。
 
 还需准备官方 0.6B 模型、AISHELL-1 原始音频与转写、SeACo 的评测 ID 和热词表。
@@ -90,43 +90,64 @@ AISHELL-1 没有配套的命名实体训练标注。本脚本默认仅从 train 
 {"messages":[{"role":"system","content":"可能出现的热词：北京大学，清华大学"},{"role":"user","content":"<audio>"},{"role":"assistant","content":"北京大学欢迎你"}],"audios":["/absolute/path/to/train.wav"]}
 ```
 
-CTC 阶段使用空 system 和相同参考文本，插件自动转换成 Paraformer 8404 词表标签。
+CTC 阶段使用空 system，插件将参考文本转换成 Paraformer 8404 词表标签。数据准备时，若原文
+含词表外字符，会先尝试 Unicode NFKC 归一化（例如全角英文字母转为半角）；若仍无法编码，则仅从
+CTC 清单中跳过该样本。归一化及跳过的样本 ID 和数量记录在 `summary.json` 的 `ctc_preparation` 中；
+SFT、ASR 和实体评测清单仍保留原始转写。
 训练脚本默认启用 ms-swift 的严格模式：遇到未知 CTC 标签、无法对齐的样本或其他数据错误时
 直接报错，不用其他样本替代。应修正或显式过滤出错的样本后再继续训练和验证。
 
 ## 3. 下载 0.6B 基座并训练热词 SFT
 
-脚本默认加载 `Qwen/Qwen3-ASR-0.6B`，命中本机 Hugging Face 缓存时直接复用；首次运行会下载。
+脚本默认加载项目内的 `model/Qwen3-ASR-0.6B`，并从 `artifacts/aishell` 读取数据。
+当前机器的该模型目录已链接到本地基座。其他环境需将权重放入此目录，或建立符号链接：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/train_swift.sh sft
+mkdir -p model
+ln -s /path/to/Qwen3-ASR-0.6B model/Qwen3-ASR-0.6B
 ```
 
-如果希望使用独立本地目录，可运行 `hf download Qwen/Qwen3-ASR-0.6B --local-dir ckpt/Qwen3-ASR-0.6B`，
-然后通过 `MODEL_PATH="$PWD/ckpt/Qwen3-ASR-0.6B"` 指定。不要使用先前下载的作者 1.7B 权重代替 0.6B 基座。
+也可以通过 `MODEL_PATH` 和 `DATA_DIR` 指定其他模型或数据路径。
+
+```bash
+bash scripts/train_swift.sh
+```
+
+也可以运行 `hf download Qwen/Qwen3-ASR-0.6B --local-dir model/Qwen3-ASR-0.6B` 下载基座。
+不要使用作者的 1.7B 权重代替 0.6B 基座。
 
 这里采用完整 LLM 参数微调，冻结 `thinker.audio_tower`（含投影），不使用 LoRA。
 默认 FP32 参数 + BF16 自动混合精度计算，避免小学习率更新直接舍入到 BF16 参数中；
-使用 SDPA、梯度检查点、单卡 batch=1、累积 16、学习率 `2e-6`、2 个 epoch。
+默认使用物理 GPU 3、6 做单机两卡数据并行，每卡 batch=8、累积 8 步，有效 batch=128；
+同时使用 SDPA、梯度检查点、学习率 `2e-6`、2 个 epoch。可以通过
+`CUDA_VISIBLE_DEVICES=1,3 bash scripts/train_swift.sh` 换卡；`NPROC_PER_NODE` 默认等于所选卡数。
+有效 batch = 每卡 batch × GPU 数 × 梯度累积步数；可在脚本末尾通过
+`--per_device_train_batch_size` 和 `--gradient_accumulation_steps` 覆盖默认值。
+更换 GPU 数量时，有效 batch 也会随之变化。多任务端口冲突时可设置 `MASTER_PORT`。
+每卡 batch=8 尚未经真实多样本 GPU 训练验证；不同长度音频会影响显存占用，建议先跑短流程。
 先跑少量步数检查数据/显存，然后根据 dev loss 和实际热词识别指标调参；不要仅依据训练 loss。
 不同显卡的显存占用需实测，显存不足可先降低 `--max_length`，但必须确保音频 token 未被截断。
 
 短流程检查示例：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 OUTPUT_DIR="$PWD/artifacts/sft-smoke" \
+OUTPUT_DIR="$PWD/artifacts/sft-smoke" \
   bash scripts/train_swift.sh sft \
   --max_steps 2 --gradient_accumulation_steps 1 \
   --save_steps 2 --eval_steps 2 --logging_steps 1
 ```
 
-正式训练输出在 `artifacts/sft-0.6b/checkpoint-<step>`，根据验证结果选择 checkpoint。
-阶段二必须从所选的阶段一 checkpoint 开始，不能重新指向官方基座。
+正式训练输出在 `artifacts/sft-0.6b/checkpoint-<step>`。阶段二默认选择包含配置与权重文件的
+最高步数 checkpoint，并打印所选路径；最高步数不一定是验证集上最优的结果，且复用输出目录时可能包含旧运行的检查点。
+如需选择其他 checkpoint，应通过 `MODEL_PATH` 明确指定。阶段二不能重新指向官方基座。
 
 ## 4. 冻结主模型，训练 CTC
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 MODEL_PATH="$PWD/artifacts/sft-0.6b/checkpoint-<step>" \
+bash scripts/train_swift.sh ctc
+
+# 可选：指定根据验证结果选出的 SFT checkpoint
+MODEL_PATH="$PWD/artifacts/sft-0.6b/checkpoint-<step>" \
   bash scripts/train_swift.sh ctc
 ```
 
