@@ -13,7 +13,10 @@ import json
 from pathlib import Path
 import random
 import re
+import unicodedata
 import wave
+
+from utils.paraformer_vocab import get_vocab
 
 HOTWORD_PREFIX = "可能出现的热词："
 
@@ -128,6 +131,26 @@ def swift_row(row, hotwords=()):
     }
 
 
+def ctc_rows(rows, vocab, report):
+    """Build valid CTC targets while preserving the original transcript elsewhere."""
+    for row in rows:
+        text = row["text"]
+        labels = vocab.encode_text(text, strip_punct=True)
+        if vocab.unk_id in labels:
+            normalized = unicodedata.normalize("NFKC", text)
+            normalized_labels = vocab.encode_text(normalized, strip_punct=True)
+            if normalized_labels and vocab.unk_id not in normalized_labels:
+                text = normalized
+                report["normalized_ids"].append(row["uttid"])
+            else:
+                report["skipped_ids"].append(row["uttid"])
+                continue
+        elif not labels:
+            report["skipped_ids"].append(row["uttid"])
+            continue
+        yield swift_row({**row, "text": text})
+
+
 def sample_hotwords(row, lexicon, matcher, seed=42, empty_ratio=0.2, negative_ratio=0.1,
                     max_positive=4, distractors=8):
     digest = hashlib.sha256(f"{seed}:{row['uttid']}".encode()).digest()
@@ -173,12 +196,18 @@ def prepare(args):
     out.mkdir(parents=True, exist_ok=True)
     (out / "train_hotwords.txt").write_text("\n".join(lexicon) + "\n", encoding="utf-8")
     counts = {}
+    ctc_preparation = {}
+    vocab = get_vocab()
     for split, rows in splits.items():
         # Reference-only manifests can be passed to infer_vllm.py. No oracle hotword prompt.
         write_jsonl(out / f"{split}_asr.jsonl", (swift_row(row) for row in rows))
         counts[split] = len(rows)
         if split in ("train", "dev"):
-            write_jsonl(out / f"{split}_ctc.jsonl", (swift_row(row) for row in rows))
+            report = {"normalized_ids": [], "skipped_ids": []}
+            write_jsonl(out / f"{split}_ctc.jsonl", ctc_rows(rows, vocab, report))
+            report["normalized_count"] = len(report["normalized_ids"])
+            report["skipped_count"] = len(report["skipped_ids"])
+            ctc_preparation[split] = report
             write_jsonl(out / f"{split}_sft.jsonl", (
                 swift_row(row, sample_hotwords(
                     row, lexicon, matcher, args.seed, args.empty_ratio, args.negative_ratio,
@@ -197,6 +226,7 @@ def prepare(args):
             counts[f"{split}_ne"] = len(rows)
     summary = {
         "aishell_root": str(root), "counts": counts, "skipped": skipped,
+        "ctc_preparation": ctc_preparation,
         "training_lexicon_size": len(lexicon), "seed": args.seed,
         "hotword_sampling": {"empty_ratio": args.empty_ratio, "negative_only_ratio": args.negative_ratio,
                              "max_positive": args.max_positive, "distractors": args.distractors},

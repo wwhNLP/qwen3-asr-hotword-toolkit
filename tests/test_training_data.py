@@ -97,6 +97,39 @@ class AISHELLPreparationTest(unittest.TestCase):
         )
         self.assertEqual(set(words), {"清华", "上海"})
 
+    def test_ctc_normalizes_or_excludes_unknown_labels_without_changing_references(self):
+        examples = {
+            "dev_width": "蔡卓妍穿着黑色ｔ恤",
+            "dev_unknown": "约翰逊将扮演草薙素子这个角色",
+        }
+        folder = self.aishell / "wav/dev/speaker_dev"
+        transcript = self.aishell / "transcript/aishell_transcript_v0.8.txt"
+        with transcript.open("a", encoding="utf-8") as out:
+            for uttid, text in examples.items():
+                with wave.open(str(folder / f"{uttid}.wav"), "wb") as wav:
+                    wav.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                    wav.writeframes(b"\0\0" * 1600)
+                out.write(f"\n{uttid} {' '.join(text)}")
+
+        output = self.run_prepare()
+        def load(name):
+            return {row["uttid"]: row for row in map(json.loads, (output / name).read_text().splitlines())}
+        ctc = load("dev_ctc.jsonl")
+        self.assertEqual(ctc["dev_width"]["messages"][-1]["content"], "蔡卓妍穿着黑色t恤")
+        self.assertNotIn("dev_unknown", ctc)
+        for name in ("dev_sft.jsonl", "dev_asr.jsonl"):
+            rows = load(name)
+            for uttid, text in examples.items():
+                self.assertEqual(rows[uttid]["messages"][-1]["content"], text)
+        self.assertEqual(set(load("dev_ne.jsonl")), {"dev_a"})
+        report = json.loads((output / "summary.json").read_text())["ctc_preparation"]
+        self.assertEqual(report["dev"]["normalized_ids"], ["dev_width"])
+        self.assertEqual(report["dev"]["skipped_ids"], ["dev_unknown"])
+        self.assertEqual(report["dev"]["normalized_count"], 1)
+        self.assertEqual(report["dev"]["skipped_count"], 1)
+        self.assertEqual(report["train"]["normalized_count"], 0)
+        self.assertEqual(report["train"]["skipped_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
