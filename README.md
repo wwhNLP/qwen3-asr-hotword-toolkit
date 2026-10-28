@@ -1,14 +1,26 @@
 <div align="center">
 
-# 🎙️ Qwen3-ASR Hotword vLLM
+# 🎙️ Qwen3-ASR Hotword Toolkit
 
 **Hotword-aware speech recognition with CTC, phoneme retrieval, and vLLM**
 
-[Quick start](#-quick-start) · [Training](#-training) · [Tests](#-tests) · [Original repository](https://github.com/Xiaoxx18/qwen3_asr_context_deploy)
+[Background](#-background) · [Quick start](#-quick-start) · [Training](#-training) · [Tests](#-tests) · [Original repository](https://github.com/Xiaoxx18/qwen3_asr_context_deploy)
 
 </div>
 
-Based on [Xiaoxx18/qwen3_asr_context_deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy), this independent repository adds a vLLM backend and a two-stage ms-swift training workflow. Given an external hotword list, it retrieves candidates using a CTC rough transcript and supplies them to Qwen3-ASR for final transcription.
+## 💡 Background
+
+Speech recognition can struggle with names and domain-specific terms. An external hotword list can provide useful context, but putting a large list into every prompt adds irrelevant candidates and increases prompt length.
+
+The original [Qwen3-ASR Context Deploy](https://github.com/Xiaoxx18/qwen3_asr_context_deploy) addresses this with a CTC branch and phoneme-based retrieval: it creates a rough transcript, selects relevant terms from a hotword list, and supplies them to Qwen3-ASR for final transcription.
+
+This repository builds on that work with:
+
+- A **vLLM backend** for the CTC, retrieval, and transcription pipeline, reusing the same audio encoding for CTC and final decoding.
+- A **two-stage ms-swift workflow** to fine-tune Qwen3-ASR-0.6B for hotword prompts, train a CTC branch, and export the checkpoint for vLLM.
+- **Robustness fixes and tests** for training, inference, and hotword retrieval, plus JSONL batch evaluation with corpus CER.
+
+The vLLM pipeline has been tested with the original author's 1.7B checkpoint. The 0.6B training-to-deployment path has only been smoke-tested for two steps per stage; full training and recognition quality remain unverified.
 
 ```mermaid
 flowchart LR
@@ -34,8 +46,8 @@ flowchart LR
 Use a separate Python 3.10+ GPU environment. The vLLM adapter targets **vLLM 0.22.1** and **Transformers 4.57.6**; install CUDA-compatible vLLM and PyTorch builds for your system.
 
 ```bash
-git clone https://github.com/wwhNLP/qwen3-asr-hotword-vllm.git
-cd qwen3-asr-hotword-vllm
+git clone https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
+cd qwen3-asr-hotword-toolkit
 python -m pip install -e '.[vllm]'
 ```
 

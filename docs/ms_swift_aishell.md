@@ -20,7 +20,7 @@ SeACo 的 `data/dev` 和 `data/test` 是评测子集，没有提供训练集。
 
 ```bash
 conda activate ms-swift
-cd /path/to/qwen3-asr-hotword-vllm
+cd /path/to/qwen3-asr-hotword-toolkit
 python -m pip install -r training/requirements.txt
 python -m pip install -e . --no-deps
 ```
