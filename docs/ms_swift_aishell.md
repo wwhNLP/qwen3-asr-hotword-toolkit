@@ -108,9 +108,10 @@ ln -s /path/to/Qwen3-ASR-0.6B model/Qwen3-ASR-0.6B
 ```
 
 也可以通过 `MODEL_PATH` 和 `DATA_DIR` 指定其他模型或数据路径。
+脚本不带阶段参数时默认运行 `ctc`，首次训练须显式指定 `sft`。
 
 ```bash
-bash scripts/train_swift.sh
+bash scripts/train_swift.sh sft
 ```
 
 也可以运行 `hf download Qwen/Qwen3-ASR-0.6B --local-dir model/Qwen3-ASR-0.6B` 下载基座。
@@ -120,7 +121,7 @@ bash scripts/train_swift.sh
 默认 FP32 参数 + BF16 自动混合精度计算，避免小学习率更新直接舍入到 BF16 参数中；
 默认使用物理 GPU 3、6 做单机两卡数据并行，每卡 batch=8、累积 8 步，有效 batch=128；
 同时使用 SDPA、梯度检查点、学习率 `2e-6`、2 个 epoch。可以通过
-`CUDA_VISIBLE_DEVICES=1,3 bash scripts/train_swift.sh` 换卡；`NPROC_PER_NODE` 默认等于所选卡数。
+`CUDA_VISIBLE_DEVICES=1,3 bash scripts/train_swift.sh sft` 换卡；`NPROC_PER_NODE` 默认等于所选卡数。
 有效 batch = 每卡 batch × GPU 数 × 梯度累积步数；可在脚本末尾通过
 `--per_device_train_batch_size` 和 `--gradient_accumulation_steps` 覆盖默认值。
 更换 GPU 数量时，有效 batch 也会随之变化。多任务端口冲突时可设置 `MASTER_PORT`。

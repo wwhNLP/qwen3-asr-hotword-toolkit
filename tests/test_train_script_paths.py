@@ -71,7 +71,10 @@ class TrainScriptPathsTest(unittest.TestCase):
     def test_default_stage_accepts_extra_arguments_without_stage(self):
         result = self.run_script("--max_steps", "2", env={**self.env, "MODEL_PATH": "/chosen/model"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines()[-2:], ["--max_steps", "2"])
+        args = result.stdout.splitlines()
+        self.assertEqual(args[args.index("--model_type") + 1], "qwen3_asr_context_ctc")
+        self.assertEqual(args[args.index("--dataset") + 1], str(self.root / "artifacts/aishell/train_ctc.jsonl"))
+        self.assertEqual(args[-2:], ["--max_steps", "2"])
 
     def test_default_two_gpu_data_parallel_batch(self):
         result = self.run_script("sft")
