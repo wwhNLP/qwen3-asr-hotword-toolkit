@@ -11,6 +11,30 @@ from qwen3_asr_vllm.cli import main
 
 
 class VLLMInputOutputPathsTest(unittest.TestCase):
+    def test_ctc_rejects_request_options_before_loading_or_truncating_output(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, output = root / "input.jsonl", root / "output.jsonl"
+            original = "previous results\n"
+            output.write_text(original, encoding="utf-8")
+            for field, value in (("hotwords", ["广州"]), ("max_ctx_hotwords", 0),
+                                 ("max_new_tokens", 8)):
+                manifest.write_text(json.dumps({"audios": ["first.wav"]}) + "\n"
+                                    + json.dumps({"audios": ["second.wav"], field: value}) + "\n")
+                with self.subTest(field=field), patch("qwen3_asr_vllm.cli.VLLMContextASR") as engine, \
+                     contextlib.redirect_stderr(io.StringIO()) as error:
+                    with self.assertRaises(SystemExit):
+                        main(["--model", "unused", "--test-json", str(manifest), "--mode", "ctc",
+                              "--batch-size", "1", "--out-json", str(output)])
+                    self.assertIn("input.jsonl:2:", error.getvalue())
+                    engine.assert_not_called()
+                    self.assertEqual(output.read_text(encoding="utf-8"), original)
+            with patch("qwen3_asr_vllm.cli.VLLMContextASR") as engine, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    main(["--model", "unused", "--audio", "x.wav", "--mode", "ctc", "--hotword", "广州"])
+                engine.assert_not_called()
+
     def test_invalid_later_request_is_rejected_before_engine_or_output(self):
         with TemporaryDirectory() as directory:
             manifest = Path(directory) / "input.jsonl"

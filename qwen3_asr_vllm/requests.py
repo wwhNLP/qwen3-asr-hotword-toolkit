@@ -57,6 +57,14 @@ def normalize_options(count, hotwords=None, request_options=None):
     return result
 
 
+def validate_mode_options(mode, options):
+    """Reject request parameters that the selected mode cannot use."""
+    if mode == "ctc" and any(option.hotwords is not None
+                             or option.max_ctx_hotwords is not None
+                             or option.max_new_tokens is not None for option in options):
+        raise ValueError("Request hotwords and generation options require asr or ctc_rag mode.")
+
+
 class RequestVocabularyCache:
     """LRU bounded by entries and vocabulary text bytes, not total object memory.
 

@@ -9,7 +9,7 @@ from threading import Lock
 import numpy as np
 
 from . import ARCHITECTURE, register
-from .requests import RequestPhonemeCache, RequestVocabularyCache, normalize_options
+from .requests import RequestPhonemeCache, RequestVocabularyCache, normalize_options, validate_mode_options
 from utils.asr_metrics import transcript_text
 
 
@@ -144,10 +144,7 @@ class VLLMContextASR:
         """Transcribe a batch with optional shared and per-audio hotword options."""
         waveforms = [read_audio(audio) if isinstance(audio, (str, Path)) else np.asarray(audio, dtype=np.float32) for audio in audios]
         options = normalize_options(len(waveforms), hotwords, request_options)
-        if self.mode == "ctc" and any(option.hotwords is not None
-                                      or option.max_ctx_hotwords is not None
-                                      or option.max_new_tokens is not None for option in options):
-            raise ValueError("Request hotwords and generation options require asr or ctc_rag mode.")
+        validate_mode_options(self.mode, options)
         for waveform in waveforms:
             if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
                 raise ValueError("Audio must be a nonempty, finite, mono waveform at 16 kHz.")

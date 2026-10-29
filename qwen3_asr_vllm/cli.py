@@ -8,7 +8,7 @@ from itertools import chain
 from pathlib import Path
 
 from .runtime import VLLMContextASR
-from .requests import normalize_options
+from .requests import normalize_options, validate_mode_options
 from utils.asr_metrics import cer_counts
 from utils.inference_io import ensure_output_not_input
 
@@ -41,7 +41,7 @@ def build_parser():
     return parser
 
 
-def iter_samples(path):
+def iter_samples(path, mode=None):
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip():
@@ -63,7 +63,8 @@ def iter_samples(path):
                        if name in sample}
             if options:
                 try:
-                    normalize_options(1, request_options=[options])
+                    normalized = normalize_options(1, request_options=[options])
+                    validate_mode_options(mode, normalized)
                 except ValueError as exc:
                     raise ValueError(f"{path}:{line_number}: {exc}") from exc
                 record["request_options"] = options
@@ -82,7 +83,7 @@ def main(argv=None):
     if args.request_cache_size < 0:
         parser.error("--request-cache-size must be nonnegative.")
     try:
-        normalize_options(1, hotwords=args.hotword)
+        validate_mode_options(args.mode, normalize_options(1, hotwords=args.hotword))
     except ValueError as exc:
         parser.error(str(exc))
     out_path = args.out_json
@@ -91,7 +92,7 @@ def main(argv=None):
     if out_path:
         # Scan the entire manifest before opening output, including later batches.
         inputs = [args.audio] if args.audio else chain(
-            [args.test_json], (sample["wav"] for sample in iter_samples(args.test_json))
+            [args.test_json], (sample["wav"] for sample in iter_samples(args.test_json, args.mode))
         )
         try:
             ensure_output_not_input(out_path, inputs)
@@ -116,7 +117,7 @@ def main(argv=None):
         dtype=args.dtype,
         enforce_eager=args.enforce_eager,
     )
-    samples = iter([{"wav": str(args.audio), "uttid": args.audio.stem, "ref": None}]) if args.audio else iter_samples(args.test_json)
+    samples = iter([{"wav": str(args.audio), "uttid": args.audio.stem, "ref": None}]) if args.audio else iter_samples(args.test_json, args.mode)
     stream = out_path.open("w", encoding="utf-8") if out_path else None
     before = engine.runtime_stats()["encoder_forward_calls"] if args.verify_encoder_reuse else None
     total = 0
