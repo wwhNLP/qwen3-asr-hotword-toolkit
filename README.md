@@ -87,7 +87,7 @@ Both inference entry points reject output paths that alias the input manifest or
 
 The [ms-swift + AISHELL-1 guide](docs/ms_swift_aishell.md) (Chinese) covers data preparation, hotword-aware SFT, CTC-only training, checkpoint export, and vLLM inference. It starts from the official Qwen3-ASR-0.6B base model. Use AISHELL-1 **train** for training and reserve the SeACo dev/test subsets for evaluation.
 
-The 0.6B training → export → vLLM pipeline was smoke-tested for **two steps per training stage**; full AISHELL-1 training and resulting recognition quality have not been validated. The [upstream README](https://github.com/Xiaoxx18/qwen3_asr_context_deploy#readme) contains the original author's benchmark results, which are not results from this repository's 0.6B smoke test.
+The 0.6B training → export → vLLM pipeline was initially smoke-tested for **two steps per training stage**. A completed local AISHELL-1 checkpoint was later used for [latency measurements](docs/vllm_optimization.md); corpus-level recognition quality has not yet been evaluated. The [upstream README](https://github.com/Xiaoxx18/qwen3_asr_context_deploy#readme) reports the original author's recognition benchmarks.
 
 ## 🧪 Tests
 
@@ -105,7 +105,11 @@ CUDA_VISIBLE_DEVICES=0 VLLM_USE_FLASHINFER_SAMPLER=0 \
 
 ## 📌 Current limits
 
-The vLLM adapter supports a **single GPU** and an **unquantized, merged checkpoint**. TP/PP, mixed multimodal requests, and loading LoRA adapters directly are not supported. Audio segments default to a maximum of 30 seconds; split longer recordings or adjust `--max-audio-seconds`. Encoded features pass through CPU memory between preparation and generation. Use `infer_vllm.py` for the complete hotword pipeline; `vllm serve` alone does not run its context preparation.
+The vLLM adapter supports a **single GPU** and an **unquantized, merged checkpoint**. TP/PP, mixed multimodal requests, and loading LoRA adapters directly are not supported. Audio segments default to a maximum of 30 seconds; split longer recordings or adjust `--max-audio-seconds`. Use `infer_vllm.py` for the complete hotword pipeline; `vllm serve` alone does not run its context preparation.
+
+Audio encoding and CTC run in microbatches (`--prepare-batch-size 4`). For larger batches, CPU hotword retrieval overlaps preparation of the next microbatch. Features stay on the worker GPU by default; only IDs and lengths cross the process boundary. A 256 MiB request cache is released after generation, including on errors. `--embedding-transport cpu` provides the original feature-transfer path for comparison. `--batch-size` controls the number of utterances submitted together for final decoding.
+
+See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The supported inference version remains **vLLM 0.22.1**.
 
 ## 🙏 Credits and license
 
