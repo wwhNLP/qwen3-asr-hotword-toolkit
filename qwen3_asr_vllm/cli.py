@@ -8,6 +8,7 @@ from itertools import chain
 from pathlib import Path
 
 from .runtime import VLLMContextASR
+from .requests import normalize_options
 from utils.asr_metrics import cer_counts
 from utils.inference_io import ensure_output_not_input
 
@@ -20,7 +21,7 @@ def build_parser():
     source.add_argument("--test-json", type=Path, help="JSONL with audios/messages/uttid fields")
     parser.add_argument("--mode", choices=("asr", "ctc", "ctc_rag"), default="ctc_rag")
     parser.add_argument("--hot-txt", type=Path)
-    parser.add_argument("--hotword", action="append", default=[], help="Manual system hotword in asr mode")
+    parser.add_argument("--hotword", action="append", help="Request hotword; repeat for multiple words")
     parser.add_argument("--rag-threshold", type=float, default=0.85)
     parser.add_argument("--max-ctx-hotwords", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -31,6 +32,7 @@ def build_parser():
     parser.add_argument("--prepare-batch-size", type=int, default=4, help="Audio encoder/CTC microbatch size")
     parser.add_argument("--rag-workers", type=int, default=4, help="Native CPU retrieval workers; 1 uses serial scoring")
     parser.add_argument("--rag-refiner", choices=("auto", "python", "numba"), default="auto", help="Weighted matching backend; auto uses Numba when available")
+    parser.add_argument("--request-cache-size", type=int, default=8, help="Maximum cached request vocabularies; 0 disables caching")
     parser.add_argument("--embedding-transport", choices=("device", "cpu"), default="device", help="Keep features on the worker GPU or transfer through CPU")
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -48,7 +50,7 @@ def iter_samples(path):
             audios = sample.get("audios", [])
             if len(audios) != 1:
                 raise ValueError(f"{path}:{line_number}: exactly one audio per record is required.")
-            yield {
+            record = {
                 "wav": audios[0],
                 "uttid": sample.get("uttid", Path(audios[0]).stem),
                 "ref": next(
@@ -57,6 +59,15 @@ def iter_samples(path):
                     None,
                 ),
             }
+            options = {name: sample[name] for name in ("hotwords", "max_ctx_hotwords", "max_new_tokens")
+                       if name in sample}
+            if options:
+                try:
+                    normalize_options(1, request_options=[options])
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{line_number}: {exc}") from exc
+                record["request_options"] = options
+            yield record
 
 
 def main(argv=None):
@@ -68,6 +79,12 @@ def main(argv=None):
         parser.error("--batch-size and --prepare-batch-size must be positive.")
     if args.rag_workers < 1:
         parser.error("--rag-workers must be positive.")
+    if args.request_cache_size < 0:
+        parser.error("--request-cache-size must be nonnegative.")
+    try:
+        normalize_options(1, hotwords=args.hotword)
+    except ValueError as exc:
+        parser.error(str(exc))
     out_path = args.out_json
     if out_path is None and args.test_json:
         out_path = args.test_json.with_name(f"{args.test_json.stem}_{args.mode}_vllm.jsonl")
@@ -91,6 +108,7 @@ def main(argv=None):
         prepare_batch_size=args.prepare_batch_size,
         rag_workers=args.rag_workers,
         rag_refiner=args.rag_refiner,
+        request_cache_size=args.request_cache_size,
         embedding_transport=args.embedding_transport,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
@@ -114,7 +132,10 @@ def main(argv=None):
                 batch.append(sample)
             if not batch:
                 break
-            outputs = engine.transcribe_batch([sample["wav"] for sample in batch], hotwords=args.hotword)
+            outputs = engine.transcribe_batch(
+                [sample["wav"] for sample in batch], hotwords=args.hotword,
+                request_options=[sample.get("request_options") for sample in batch],
+            )
             for sample, output in zip(batch, outputs):
                 record = {**sample, **output}
                 if sample["ref"] is not None:

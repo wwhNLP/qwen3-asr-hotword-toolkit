@@ -22,7 +22,7 @@ class VLLMIntegrationTest(unittest.TestCase):
             os.environ["VLLM_TEST_MODEL"],
             mode="ctc_rag",
             enforce_eager=os.environ.get("VLLM_TEST_EAGER", "1") != "0",
-            gpu_memory_utilization=0.3,
+            gpu_memory_utilization=float(os.environ.get("VLLM_TEST_GPU_MEMORY_UTILIZATION", "0.3")),
             max_model_len=2048,
             max_num_seqs=2,
             max_new_tokens=128,
@@ -88,6 +88,30 @@ class VLLMIntegrationTest(unittest.TestCase):
         self.assertEqual(self.engine.runtime_stats()["context_cache_items"], 0)
         self.assertEqual(len(results), 2)
         self.assertTrue(all(isinstance(result["text"], str) for result in results))
+
+    def test_per_audio_vocabulary_limits_and_cache_are_isolated(self):
+        before = self.engine.runtime_stats()["encoder_forward_calls"]
+        original_batch_size = self.engine.prepare_batch_size
+        self.engine.prepare_batch_size = 1
+        try:
+            results = self.engine.transcribe_batch(
+                [self.waveform, self.waveform, self.waveform],
+                request_options=[
+                    {"hotwords": [self.hotword], "max_ctx_hotwords": 1, "max_new_tokens": 32},
+                    {"hotwords": [], "max_ctx_hotwords": 0, "max_new_tokens": 16},
+                    {"hotwords": [self.hotword], "max_ctx_hotwords": 1, "max_new_tokens": 24},
+                ],
+            )
+        finally:
+            self.engine.prepare_batch_size = original_batch_size
+        self.assertEqual([result["hotwords"] for result in results],
+                         [[self.hotword], [], [self.hotword]])
+        self.assertEqual(self.engine.runtime_stats()["encoder_forward_calls"] - before, 3)
+        self.assertEqual(self.engine.runtime_stats()["context_cache_items"], 0)
+        cache = self.engine.request_cache_info()
+        self.engine.transcribe(self.waveform, hotwords=[self.hotword])
+        self.assertEqual(self.engine.request_cache_info()["hits"], cache["hits"] + 1)
+        self.assertIn(self.hotword, self.engine.transcribe(self.waveform)["hotwords"])
 
     def test_packed_encoding_and_ctc_match_individual_utterances(self):
         from qwen3_asr_vllm.transport import unpack_embeddings
