@@ -28,6 +28,8 @@ def build_parser():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--prepare-batch-size", type=int, default=4, help="Audio encoder/CTC microbatch size")
+    parser.add_argument("--embedding-transport", choices=("device", "cpu"), default="device", help="Keep features on the worker GPU or transfer through CPU")
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--verify-encoder-reuse", action="store_true")
@@ -60,8 +62,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.model:
         parser.error("--model or MODEL_PATH is required.")
-    if args.batch_size < 1:
-        parser.error("--batch-size must be positive.")
+    if args.batch_size < 1 or args.prepare_batch_size < 1:
+        parser.error("--batch-size and --prepare-batch-size must be positive.")
     out_path = args.out_json
     if out_path is None and args.test_json:
         out_path = args.test_json.with_name(f"{args.test_json.stem}_{args.mode}_vllm.jsonl")
@@ -82,6 +84,8 @@ def main(argv=None):
         max_ctx_hotwords=args.max_ctx_hotwords,
         max_new_tokens=args.max_new_tokens,
         max_audio_seconds=args.max_audio_seconds,
+        prepare_batch_size=args.prepare_batch_size,
+        embedding_transport=args.embedding_transport,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_seqs=args.batch_size,

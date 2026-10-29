@@ -1,5 +1,7 @@
 """Synchronous, single-GPU vLLM context-ASR pipeline."""
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
 from threading import Lock
@@ -31,10 +33,10 @@ def read_audio(path):
 
 
 class VLLMContextASR:
-    """Keep audio encoding, CTC, phoneme retrieval and decoding in vLLM.
+    """Batch neural inference in vLLM; overlap CPU retrieval with GPU preparation.
 
     Calls are serialized because preparation RPC and generation share one
-    engine. Use transcribe_batch to batch final decoding across utterances.
+    engine. transcribe_batch batches encoding, CTC and final decoding.
     This adapter targets vLLM 0.22.1 and an unquantized, merged checkpoint.
     """
 
@@ -48,12 +50,18 @@ class VLLMContextASR:
         max_ctx_hotwords=10,
         max_new_tokens=512,
         max_audio_seconds=30,
+        prepare_batch_size=4,
+        embedding_transport="device",
         **engine_kwargs,
     ):
         if mode not in {"asr", "ctc", "ctc_rag"}:
             raise ValueError("mode must be asr, ctc or ctc_rag.")
         if max_ctx_hotwords < 0 or max_new_tokens <= 0 or max_audio_seconds <= 0:
             raise ValueError("Hotword limit must be nonnegative and token/audio limits positive.")
+        if not isinstance(prepare_batch_size, int) or prepare_batch_size < 1:
+            raise ValueError("prepare_batch_size must be a positive integer.")
+        if embedding_transport not in {"device", "cpu"}:
+            raise ValueError("embedding_transport must be device or cpu.")
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
         if version("vllm").split("+")[0] != "0.22.1":
@@ -69,6 +77,19 @@ class VLLMContextASR:
             hot_txt = Path(__file__).resolve().parents[1] / "hotword" / "hot.txt"
         hotword_text = Path(hot_txt).read_text(encoding="utf-8") if mode == "ctc_rag" else ""
         from vllm import LLM, SamplingParams
+        from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
+
+        self._processor = Qwen3ASRProcessor.from_pretrained(
+            str(model), revision=engine_kwargs.get("revision"), trust_remote_code=False
+        )
+        self._corrector = None
+        if mode == "ctc_rag":
+            from hotword import PhonemeCorrector
+            self._corrector = PhonemeCorrector(threshold=rag_threshold)
+            self._corrector.update_hotwords(hotword_text)
+        self.prepare_batch_size = prepare_batch_size
+        self.embedding_transport = embedding_transport
+        self.max_ctx_hotwords = max_ctx_hotwords
 
         register()
         overrides = dict(engine_kwargs.pop("hf_overrides", {}) or {})
@@ -94,7 +115,7 @@ class VLLMContextASR:
             args=(
                 {
                     "mode": mode,
-                    "hotword_text": hotword_text,
+                    "hotword_text": "",
                     "threshold": rag_threshold,
                     "max_hotwords": max_ctx_hotwords,
                 },
@@ -115,41 +136,77 @@ class VLLMContextASR:
             return []
         with self._lock:
             prepared = []
-            for waveform in waveforms:
-                (item,) = self.llm.collective_rpc(
-                    "context_prepare", args=(waveform.tobytes(), self.mode, list(hotwords or []))
-                )
+            cached_ids = []
+            try:
+                # Only the main thread touches vLLM. While the worker encodes
+                # chunk N+1, this CPU thread retrieves hotwords for chunk N.
+                overlap = self.mode == "ctc_rag" and len(waveforms) > self.prepare_batch_size
+                executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asr-rag") if overlap else nullcontext()
+                with executor as pool:
+                    pending = []
+                    for offset in range(0, len(waveforms), self.prepare_batch_size):
+                        chunk = waveforms[offset:offset + self.prepare_batch_size]
+                        (items,) = self.llm.collective_rpc(
+                            "context_prepare_batch",
+                            args=([waveform.tobytes() for waveform in chunk], self.mode,
+                                  self.embedding_transport == "device"),
+                        )
+                        cached_ids.extend(key for item in items for key in item.get("audio_context_ids", []))
+                        if len(items) != len(chunk):
+                            raise RuntimeError("Worker returned an unexpected number of audio contexts.")
+                        if pool is None:
+                            prepared.extend(self._finish_context_batch(items, list(hotwords or [])))
+                        else:
+                            pending.append(pool.submit(self._finish_context_batch, items, list(hotwords or [])))
+                    for future in pending:
+                        prepared.extend(future.result())
+                results = []
                 if self.mode != "ctc":
-                    import torch
-                    from .transport import unpack_embeddings
+                    requests = [self._generation_request(item) for item in prepared]
+                    results = self.llm.generate(requests, self.sampling_params, use_tqdm=False)
+                    if len(results) != len(prepared):
+                        raise RuntimeError("Decoder returned an unexpected number of transcriptions.")
+                outputs = []
+                for index, item in enumerate(prepared):
+                    text = item["rough"] if self.mode == "ctc" else results[index].outputs[0].text
+                    output = {"mode": self.mode, "text": transcript_text(text)}
+                    if self.mode == "ctc_rag":
+                        output.update(rough=item["rough"], hotwords=item["hotwords"])
+                    outputs.append(output)
+                return outputs
+            finally:
+                # Also release on retrieval, prompt processing or decoding errors.
+                if cached_ids:
+                    self.llm.collective_rpc("context_release", args=(cached_ids,))
 
-                    item = dict(item)
-                    item["audio_embeds"] = unpack_embeddings(item["audio_embeds"])
-                    item["audio_output_lengths"] = torch.tensor(item["audio_output_lengths"], dtype=torch.long)
-                prepared.append(item)
-            results = []
+    def _finish_context_batch(self, items, manual_hotwords):
+        for item in items:
+            hotwords = manual_hotwords
+            if self.mode == "ctc_rag":
+                hotwords = []
+                if self.max_ctx_hotwords:
+                    result = self._corrector.correct(item["rough"], k=self.max_ctx_hotwords)
+                    hotwords = select_hotwords(result, self.max_ctx_hotwords)
+            item["hotwords"] = hotwords
             if self.mode != "ctc":
-                requests = [
-                    {
-                        "prompt": item["prompt"],
-                        "multi_modal_data": {
-                            "audio": {
-                                "audio_embeds": item["audio_embeds"],
-                                "audio_output_lengths": item["audio_output_lengths"],
-                            }
-                        },
-                    }
-                    for item in prepared
-                ]
-                results = self.llm.generate(requests, self.sampling_params, use_tqdm=False)
-            outputs = []
-            for index, item in enumerate(prepared):
-                text = item["rough"] if self.mode == "ctc" else results[index].outputs[0].text
-                output = {"mode": self.mode, "text": transcript_text(text)}
-                if self.mode == "ctc_rag":
-                    output.update(rough=item["rough"], hotwords=item["hotwords"])
-                outputs.append(output)
-            return outputs
+                system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""
+                item["prompt"] = self._processor.apply_chat_template([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+                ], add_generation_prompt=True, tokenize=False)
+        return items
+
+    @staticmethod
+    def _generation_request(item):
+        import torch
+        from .transport import unpack_embeddings
+
+        audio = {"audio_output_lengths": torch.tensor(item["audio_output_lengths"], dtype=torch.long)}
+        if "audio_context_ids" in item:
+            audio["audio_context_ids"] = torch.tensor(item["audio_context_ids"], dtype=torch.long)
+        else:
+            audio["audio_embeds"] = unpack_embeddings(item["audio_embeds"])
+        return {"prompt": item["prompt"], "multi_modal_data": {"audio": audio}}
 
     def runtime_stats(self):
         with self._lock:

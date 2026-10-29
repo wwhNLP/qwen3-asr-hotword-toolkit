@@ -11,6 +11,17 @@ class ContextWorkerExtension:
         waveform = np.frombuffer(waveform_bytes, dtype=np.float32).copy()
         return self.get_model().prepare_context(waveform, mode=mode, hotwords=hotwords)
 
+    def context_prepare_batch(self, waveforms_bytes, mode, cache_on_device=True):
+        import numpy as np
+
+        waveforms = [np.frombuffer(data, dtype=np.float32) for data in waveforms_bytes]
+        return self.get_model().prepare_context_batch(
+            waveforms, mode=mode, cache_on_device=cache_on_device,
+        )
+
+    def context_release(self, ids):
+        self.get_model().release_context(ids)
+
     def context_stats(self):
         return self.get_model().context_runtime_stats()
 

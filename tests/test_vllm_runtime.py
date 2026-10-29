@@ -1,5 +1,5 @@
 import unittest
-from threading import Lock
+from threading import Lock, Event
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from qwen3_asr_vllm.runtime import VLLMContextASR, select_hotwords
-from qwen3_asr_vllm.transport import pack_embeddings, unpack_embeddings
+from qwen3_asr_vllm.transport import EmbeddingCache, pack_embeddings, unpack_embeddings
 
 
 class HotwordSelectionTest(unittest.TestCase):
@@ -21,51 +21,125 @@ class HotwordSelectionTest(unittest.TestCase):
 
 
 class VLLMRuntimeTest(unittest.TestCase):
-    def make_runtime(self, mode):
+    def make_runtime(self, mode, transport="device"):
         runtime = VLLMContextASR.__new__(VLLMContextASR)
         runtime.mode = mode
         runtime.max_audio_samples = 16000
+        runtime.prepare_batch_size = 2
+        runtime.embedding_transport = transport
+        runtime.max_ctx_hotwords = 8
         runtime.sampling_params = object()
         runtime._lock = Lock()
+        runtime._processor = SimpleNamespace(apply_chat_template=Mock(side_effect=lambda messages, **kw: str(messages)))
+        runtime._corrector = SimpleNamespace(correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
         features = torch.randn(13, 8)
-        prepared = {
-            "prompt": "system hotwords; audio placeholder",
-            "rough": "粗转写",
-            "hotwords": ["热词"],
-            "audio_embeds": pack_embeddings(features),
-            "audio_output_lengths": [13],
-        }
-        worker_model = SimpleNamespace(context_prepare=Mock(return_value=prepared))
+        next_id = 0
+
+        def prepare(waveforms, mode, cache_on_device):
+            nonlocal next_id
+            items = []
+            for _ in waveforms:
+                next_id += 1
+                item = {"rough": f"粗转写{next_id}", "audio_output_lengths": [13]}
+                if mode != "ctc":
+                    if cache_on_device:
+                        item["audio_context_ids"] = [next_id]
+                    else:
+                        item["audio_embeds"] = pack_embeddings(features)
+                items.append(item)
+            return items
+
+        worker = SimpleNamespace(context_prepare_batch=Mock(side_effect=prepare), context_release=Mock())
         runtime.llm = SimpleNamespace(
-            collective_rpc=Mock(side_effect=lambda method, args=(): [getattr(worker_model, method)(*args)]),
-            generate=Mock(return_value=[SimpleNamespace(outputs=[SimpleNamespace(text="最终转写")])]),
+            collective_rpc=Mock(side_effect=lambda method, args=(): [getattr(worker, method)(*args)]),
+            generate=Mock(side_effect=lambda requests, *a, **kw: [SimpleNamespace(outputs=[SimpleNamespace(text="最终转写")]) for _ in requests]),
         )
-        return runtime, worker_model, features
+        return runtime, worker, features
 
-    def test_rag_generation_reuses_worker_embeddings_without_raw_audio(self):
-        runtime, worker_model, features = self.make_runtime("ctc_rag")
-        waveform = np.zeros(1600, dtype=np.float32)
-        output = runtime.transcribe(waveform)
-        self.assertEqual(output, {"mode": "ctc_rag", "text": "最终转写", "rough": "粗转写", "hotwords": ["热词"]})
-        worker_model.context_prepare.assert_called_once()
+    def test_rag_batch_passes_only_context_ids_and_releases_them(self):
+        runtime, worker, _ = self.make_runtime("ctc_rag")
+        waves = [np.zeros(size, dtype=np.float32) for size in (1600, 3200, 4800)]
+        outputs = runtime.transcribe_batch(waves)
+        self.assertEqual([item["rough"] for item in outputs], ["粗转写1", "粗转写2", "粗转写3"])
+        self.assertTrue(all(item["hotwords"] == ["热词"] for item in outputs))
+        self.assertEqual(worker.context_prepare_batch.call_count, 2)
+        sent_audio = worker.context_prepare_batch.call_args_list[0].args[0]
+        for data, wave in zip(sent_audio, waves):
+            np.testing.assert_array_equal(np.frombuffer(data, dtype=np.float32), wave)
         requests = runtime.llm.generate.call_args.args[0]
-        payload = requests[0]["multi_modal_data"]["audio"]
-        self.assertEqual(set(payload), {"audio_embeds", "audio_output_lengths"})
+        for index, request in enumerate(requests):
+            audio = request["multi_modal_data"]["audio"]
+            self.assertEqual(set(audio), {"audio_context_ids", "audio_output_lengths"})
+            self.assertEqual(audio["audio_context_ids"].tolist(), [index + 1])
+        worker.context_release.assert_called_once_with([1, 2, 3])
+
+    def test_cpu_transport_preserves_embeddings(self):
+        runtime, worker, features = self.make_runtime("ctc_rag", "cpu")
+        runtime.transcribe(np.zeros(1600))
+        payload = runtime.llm.generate.call_args.args[0][0]["multi_modal_data"]["audio"]
         torch.testing.assert_close(payload["audio_embeds"], features, atol=0, rtol=0)
-        sent_audio = worker_model.context_prepare.call_args.args[0]
-        np.testing.assert_array_equal(np.frombuffer(sent_audio, dtype=np.float32), waveform)
+        worker.context_release.assert_not_called()
 
-    def test_ctc_mode_does_not_run_text_decoder(self):
-        runtime, worker_model, _ = self.make_runtime("ctc")
-        self.assertEqual(runtime.transcribe(np.zeros(1600)), {"mode": "ctc", "text": "粗转写"})
-        worker_model.context_prepare.assert_called_once()
+    def test_ctc_mode_does_not_run_text_decoder_or_cache_features(self):
+        runtime, worker, _ = self.make_runtime("ctc")
+        self.assertEqual(runtime.transcribe(np.zeros(1600)), {"mode": "ctc", "text": "粗转写1"})
+        worker.context_prepare_batch.assert_called_once()
         runtime.llm.generate.assert_not_called()
+        worker.context_release.assert_not_called()
 
-    def test_asr_mode_passes_manual_hotwords_to_worker(self):
-        runtime, worker_model, _ = self.make_runtime("asr")
+    def test_asr_mode_uses_manual_hotwords_without_retrieval(self):
+        runtime, _, _ = self.make_runtime("asr")
         output = runtime.transcribe(np.zeros(1600), hotwords=["手工热词"])
         self.assertEqual(output, {"mode": "asr", "text": "最终转写"})
-        self.assertEqual(worker_model.context_prepare.call_args.args[1:], ("asr", ["手工热词"]))
+        messages = runtime._processor.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages[0]["content"], "可能出现的热词：手工热词")
+        runtime._corrector.correct.assert_not_called()
+
+    def test_retrieval_overlaps_next_gpu_batch_and_preserves_order(self):
+        runtime, worker, _ = self.make_runtime("ctc_rag")
+        runtime.prepare_batch_size = 1
+        retrieval_started, next_gpu_started = Event(), Event()
+        prepare = worker.context_prepare_batch.side_effect
+
+        def gpu(*args):
+            if worker.context_prepare_batch.call_count == 2:
+                self.assertTrue(retrieval_started.wait(2))
+                next_gpu_started.set()
+            return prepare(*args)
+
+        def retrieve(text, **kw):
+            if text == "粗转写1":
+                retrieval_started.set()
+                self.assertTrue(next_gpu_started.wait(2))
+            return SimpleNamespace(matches=[("", text, 1)], similars=[])
+
+        worker.context_prepare_batch.side_effect = gpu
+        runtime._corrector.correct.side_effect = retrieve
+        outputs = runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+        self.assertEqual([item["hotwords"] for item in outputs], [["粗转写1"], ["粗转写2"]])
+
+    def test_cached_features_are_released_on_retrieval_and_generation_errors(self):
+        for stage in ("retrieval", "prompt", "generation", "next_batch"):
+            runtime, worker, _ = self.make_runtime("ctc_rag")
+            error = RuntimeError("test failure")
+            if stage == "retrieval":
+                runtime._corrector.correct.side_effect = error
+            elif stage == "prompt":
+                runtime._processor.apply_chat_template.side_effect = error
+            elif stage == "generation":
+                runtime.llm.generate.side_effect = error
+            else:
+                runtime.prepare_batch_size = 1
+                original = worker.context_prepare_batch.side_effect
+                def fail_next_batch(*args):
+                    if worker.context_prepare_batch.call_count > 1:
+                        raise error
+                    return original(*args)
+                worker.context_prepare_batch.side_effect = fail_next_batch
+            with self.subTest(stage=stage), self.assertRaisesRegex(RuntimeError, "test failure"):
+                runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+            self.assertEqual(worker.context_release.call_count, 1)
+            self.assertEqual(worker.context_release.call_args.args[0], [1] if stage == "next_batch" else [1, 2])
 
     def test_invalid_audio_is_rejected_before_worker_execution(self):
         runtime, _, _ = self.make_runtime("ctc_rag")
@@ -79,6 +153,33 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime, _, _ = self.make_runtime("ctc_rag")
         self.assertEqual(runtime.transcribe_batch([]), [])
         runtime.llm.collective_rpc.assert_not_called()
+
+
+class EmbeddingCacheTest(unittest.TestCase):
+    def test_cache_keeps_tensor_storage_validates_shapes_and_never_reuses_ids(self):
+        cache = EmbeddingCache()
+        features = torch.randn(13, 8)
+        ids = cache.add_batch([features])
+        restored = cache.get_batch(ids, [13], 8)[0]
+        self.assertEqual(restored.data_ptr(), features.data_ptr())
+        self.assertEqual(cache.bytes, features.numel() * features.element_size())
+        with self.assertRaises(ValueError):
+            cache.get_batch(ids, [12], 8)
+        cache.release(ids)
+        cache.release(ids)
+        self.assertEqual((len(cache), cache.bytes), (0, 0))
+        with self.assertRaises(ValueError):
+            cache.get_batch(ids, [13], 8)
+        self.assertNotEqual(cache.add_batch([features]), ids)
+
+    def test_capacity_failure_is_atomic(self):
+        cache = EmbeddingCache(max_bytes=32)
+        ids = cache.add_batch([torch.zeros(4)])
+        with self.assertRaisesRegex(RuntimeError, "cache is full"):
+            cache.add_batch([torch.zeros(4), torch.zeros(4)])
+        self.assertEqual((len(cache), cache.bytes), (1, 16))
+        cache.release(ids)
+        self.assertEqual(cache.bytes, 0)
 
 
 class EmbeddingTransportTest(unittest.TestCase):

@@ -2,9 +2,8 @@
 
 import importlib.util
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 
 HAS_PINYIN = importlib.util.find_spec("pypinyin") is not None
@@ -30,32 +29,25 @@ class HotwordRetrievalTest(unittest.TestCase):
 @unittest.skipUnless(HAS_VLLM, "vLLM is required for its model adapter")
 class VLLMHotwordLimitTest(unittest.TestCase):
     def test_worker_passes_configured_limit_to_retrieval(self):
-        import torch
         import qwen3_asr_vllm.model as model_module
 
-        features = {
-            "attention_mask": torch.ones((1, 3), dtype=torch.long),
-            "input_features": torch.ones((1, 1, 3)),
-        }
         candidates = [("粗", f"词{i}", 1.0) for i in range(12)]
         corrector = Mock()
         corrector.correct.side_effect = lambda text, k: SimpleNamespace(matches=[], similars=candidates[:k])
-        processor = SimpleNamespace(feature_extractor=Mock(return_value=features),
-                                    apply_chat_template=Mock(return_value="prompt"))
+        processor = SimpleNamespace(apply_chat_template=Mock(return_value="prompt"))
         fake_model = SimpleNamespace(
             _context_processor=processor,
-            audio_tower=SimpleNamespace(device=torch.device("cpu"), dtype=torch.float32),
-            vllm_config=object(),
-            _process_audio_input=Mock(return_value=(torch.ones((3, 2)),)),
-            ctc_branch=Mock(return_value=torch.ones((3, 2))),
-            _context_vocab=SimpleNamespace(ctc_greedy_decode=Mock(return_value="粗")),
+            prepare_context_batch=Mock(return_value=[{"rough": "粗"}]),
             _context_corrector=corrector,
             _max_ctx_hotwords=12,
         )
-        with patch.object(model_module, "set_forward_context", return_value=nullcontext()):
-            result = model_module.Qwen3ASRContextForConditionalGeneration.prepare_context(
-                fake_model, [0.0] * 100, mode="ctc_rag", hotwords=[]
-            )
+        waveform = [0.0] * 100
+        result = model_module.Qwen3ASRContextForConditionalGeneration.prepare_context(
+            fake_model, waveform, mode="ctc_rag", hotwords=[]
+        )
+        fake_model.prepare_context_batch.assert_called_once_with(
+            [waveform], mode="ctc_rag", cache_on_device=False
+        )
         corrector.correct.assert_called_once_with("粗", k=12)
         self.assertEqual(result["hotwords"], [f"词{i}" for i in range(12)])
 

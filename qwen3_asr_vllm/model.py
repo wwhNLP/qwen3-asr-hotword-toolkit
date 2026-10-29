@@ -1,8 +1,9 @@
 """Native vLLM audio + CTC + RAG model, with precomputed audio input support.
 
 The public runtime uses named worker RPCs for preparation and LLM.generate for
-decoding. Both run on the same vLLM model instance. Only CPU audio embeddings
-cross the process boundary; no separate Transformers inference model is loaded.
+decoding. Both run on the same vLLM model instance. Audio embeddings can stay in
+worker-local GPU storage; only IDs cross the process boundary. No separate
+Transformers inference model is loaded.
 """
 
 import copy
@@ -30,6 +31,11 @@ from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
 
 
 def embedding_fields(data):
+    if "audio_context_ids" in data:
+        return {
+            "audio_context_ids": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+            "audio_output_lengths": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
+        }
     return {
         "audio_embeds": MultiModalFieldConfig.flat_from_sizes(
             "audio", data["audio_output_lengths"], dim=0
@@ -40,11 +46,12 @@ def embedding_fields(data):
 
 class ContextAudioParser(Qwen3ASRMultiModalDataParser):
     def _parse_audio_data(self, data):
-        if isinstance(data, Mapping) and "audio_embeds" in data:
+        if isinstance(data, Mapping) and ("audio_embeds" in data or "audio_context_ids" in data):
+            embedding_key = "audio_context_ids" if "audio_context_ids" in data else "audio_embeds"
             return DictEmbeddingItems(
                 data,
                 modality="audio",
-                required_fields={"audio_embeds", "audio_output_lengths"},
+                required_fields={embedding_key, "audio_output_lengths"},
                 fields_factory=embedding_fields,
             )
         return super()._parse_audio_data(data)
@@ -67,7 +74,7 @@ class ContextMultiModalProcessor(Qwen3ASRMultiModalProcessor):
         return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
     def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
-        if "audio_embeds" in hf_inputs:
+        if "audio_embeds" in hf_inputs or "audio_context_ids" in hf_inputs:
             return embedding_fields(hf_inputs)
         return super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
 
@@ -151,6 +158,10 @@ class Qwen3ASRContextForConditionalGeneration(Qwen3ASRForConditionalGeneration):
         self._context_corrector = None
         self._max_ctx_hotwords = 10
         self._encoder_forward_calls = 0
+        self._encoder_batches = 0
+        self._ctc_forward_calls = 0
+        from .transport import EmbeddingCache
+        self._context_cache = EmbeddingCache()
 
     def configure_context(self, *, mode, hotword_text, threshold, max_hotwords):
         if mode != "asr":
@@ -171,58 +182,95 @@ class Qwen3ASRContextForConditionalGeneration(Qwen3ASRForConditionalGeneration):
         self._max_ctx_hotwords = max_hotwords
 
     def _process_audio_input(self, audio_input):
-        self._encoder_forward_calls += 1
+        self._encoder_forward_calls += len(audio_input["audio_feature_lengths"])
+        self._encoder_batches += 1
         return super()._process_audio_input(audio_input)
 
-    @torch.inference_mode()
     def prepare_context(self, waveform, *, mode, hotwords):
+        """Compatibility RPC for clients using the original CPU payload path."""
         from .runtime import select_hotwords
+
+        (item,) = self.prepare_context_batch([waveform], mode=mode, cache_on_device=False)
+        if mode == "ctc_rag":
+            result = self._context_corrector.correct(item["rough"], k=self._max_ctx_hotwords)
+            hotwords = select_hotwords(result, self._max_ctx_hotwords)
+        system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""
+        item["hotwords"] = hotwords
+        item["prompt"] = self._context_processor.apply_chat_template([
+            {"role": "system", "content": system},
+            {"role": "user", "content": [{"type": "audio", "audio": ""}]},
+        ], add_generation_prompt=True, tokenize=False)
+        return item
+
+    @torch.inference_mode()
+    def prepare_context_batch(self, waveforms, *, mode, cache_on_device=True):
+        """One packed encoder/CTC forward for variable-length utterances."""
         from .transport import pack_embeddings
 
+        if mode not in {"asr", "ctc", "ctc_rag"}:
+            raise ValueError("Unknown context mode.")
+        if not waveforms:
+            return []
         if self._context_processor is None:
             model_config = self.vllm_config.model_config
             self._context_processor = Qwen3ASRProcessor.from_pretrained(
                 model_config.model, revision=model_config.revision, trust_remote_code=False
             )
-        processor = self._context_processor
-        features = processor.feature_extractor(
-            waveform,
-            sampling_rate=16000,
-            return_tensors="pt",
-            padding=True,
-            truncation=False,
-            return_attention_mask=True,
+        features = self._context_processor.feature_extractor(
+            waveforms, sampling_rate=16000, return_tensors="pt", padding=True,
+            truncation=False, return_attention_mask=True,
         )
+        # Strip padding before concatenation: the native encoder expects packed
+        # mel features plus each utterance's true length.
+        frame_lengths = features["attention_mask"].sum(-1).tolist()
+        if any(length <= 0 for length in frame_lengths):
+            raise ValueError("Audio features must contain at least one frame.")
         device, dtype = self.audio_tower.device, self.audio_tower.dtype
-        lengths = features["attention_mask"].sum(-1).to(device=device, dtype=torch.long)
-        mel = features["input_features"][0, :, : int(lengths[0])].to(device=device, dtype=dtype)
+        mel = torch.cat([
+            features["input_features"][index, :, :length]
+            for index, length in enumerate(frame_lengths)
+        ], dim=1).to(device=device, dtype=dtype)
+        lengths = torch.tensor(frame_lengths, device=device, dtype=torch.long)
         with set_forward_context(None, self.vllm_config):
-            (audio_embeds,) = self._process_audio_input(
+            embeddings = self._process_audio_input(
                 {"input_features": mel, "audio_feature_lengths": lengths}
             )
-            rough = ""
+            output_lengths = [len(item) for item in embeddings]
+            rough = [""] * len(embeddings)
             if mode != "asr":
                 if self.ctc_branch is None or self._context_vocab is None:
                     raise RuntimeError("CTC resources were not configured on the vLLM worker.")
-                cu_seqlens = torch.tensor([0, len(audio_embeds)], device=device, dtype=torch.int32)
-                frame_ids = self.ctc_branch(audio_embeds, cu_seqlens).argmax(-1).tolist()
-                rough = self._context_vocab.ctc_greedy_decode(frame_ids)
-        if mode == "ctc_rag":
-            result = self._context_corrector.correct(rough, k=self._max_ctx_hotwords)
-            hotwords = select_hotwords(result, self._max_ctx_hotwords)
-        system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": [{"type": "audio", "audio": ""}]},
-        ]
-        prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        prepared = {"rough": rough, "hotwords": hotwords, "prompt": prompt}
+                # Sequence boundaries prevent CTC attention crossing utterances.
+                cu_seqlens = torch.tensor([0, *output_lengths], device=device, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+                logits = self.ctc_branch(torch.cat(embeddings, dim=0), cu_seqlens)
+                self._ctc_forward_calls += 1
+                frame_ids = logits.argmax(-1).cpu().tolist()
+                offset = 0
+                for index, length in enumerate(output_lengths):
+                    rough[index] = self._context_vocab.ctc_greedy_decode(frame_ids[offset:offset + length])
+                    offset += length
+        prepared = [{"rough": text, "audio_output_lengths": [length]}
+                    for text, length in zip(rough, output_lengths)]
         if mode != "ctc":
-            prepared["audio_embeds"] = pack_embeddings(audio_embeds)
-            prepared["audio_output_lengths"] = [len(audio_embeds)]
+            if cache_on_device:
+                for item, key in zip(prepared, self._context_cache.add_batch(embeddings)):
+                    item["audio_context_ids"] = [key]
+            else:
+                for item, tensor in zip(prepared, embeddings):
+                    item["audio_embeds"] = pack_embeddings(tensor)
         return prepared
 
+    def release_context(self, ids):
+        self._context_cache.release(ids)
+
     def embed_multimodal(self, **kwargs):
+        ids = kwargs.get("audio_context_ids")
+        if ids is not None:
+            return self._context_cache.get_batch(
+                ids.reshape(-1).tolist(),
+                kwargs["audio_output_lengths"].reshape(-1).tolist(),
+                self.config.text_config.hidden_size,
+            )
         embeddings = kwargs.get("audio_embeds")
         if embeddings is None:
             return super().embed_multimodal(**kwargs)
@@ -249,4 +297,10 @@ class Qwen3ASRContextForConditionalGeneration(Qwen3ASRForConditionalGeneration):
         return positions.clone(), 0
 
     def context_runtime_stats(self):
-        return {"encoder_forward_calls": self._encoder_forward_calls}
+        return {
+            "encoder_forward_calls": self._encoder_forward_calls,
+            "encoder_batches": self._encoder_batches,
+            "ctc_forward_calls": self._ctc_forward_calls,
+            "context_cache_items": len(self._context_cache),
+            "context_cache_bytes": self._context_cache.bytes,
+        }
