@@ -66,10 +66,10 @@ CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
 
 `ctc` and `ctc_rag` require a checkpoint with a CTC branch. The included `hotword/hot.txt` is an example; replace it with a list relevant to your audio. `--verify-encoder-reuse` checks that each audio segment is encoded once.
 
-For a JSONL batch, each record needs exactly one audio path; an optional assistant message supplies the reference for CER:
+For a JSONL batch, each record needs one audio path. An optional assistant message supplies the reference for CER. Individual records can provide a vocabulary and inference limits:
 
 ```json
-{"uttid":"example","audios":["/path/to/audio.wav"],"messages":[{"role":"assistant","content":"reference transcript"}]}
+{"uttid":"example","audios":["/path/to/audio.wav"],"hotwords":["广州","康辉|康灰"],"max_ctx_hotwords":2,"max_new_tokens":64,"messages":[{"role":"assistant","content":"reference transcript"}]}
 ```
 
 ```bash
@@ -78,6 +78,24 @@ CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
   --test-json /path/to/test.jsonl --mode ctc_rag \
   --hot-txt /path/to/hotwords.txt --batch-size 8 --out-json results.jsonl
 ```
+
+In `ctc_rag` mode, request `hotwords` replace the default `--hot-txt` vocabulary for that audio; retrieval selects up to `max_ctx_hotwords` matches. Omit the field or use `null` for the default vocabulary, and use `[]` to disable hotwords for that audio. The same fields can be supplied from Python:
+
+```python
+from qwen3_asr_vllm.runtime import VLLMContextASR
+
+engine = VLLMContextASR("/path/to/checkpoint", mode="ctc_rag")
+result = engine.transcribe("/path/to/audio.wav", hotwords=["广州", "康辉"],
+                           max_ctx_hotwords=2, max_new_tokens=64)
+batch = engine.transcribe_batch(["/path/a.wav", "/path/b.wav"], request_options=[
+    {"hotwords": ["广州"], "max_ctx_hotwords": 1},
+    {"hotwords": ["康辉"], "max_new_tokens": 64},
+])
+```
+
+`--hotword` may be repeated to set a shared request vocabulary; JSONL records can override it. In `asr` mode these words are supplied directly in the prompt. Pure `ctc` mode rejects request hotwords and generation options. Bounded caches reuse request vocabulary indices and phonemes: `--request-cache-size 8` is the default and `0` disables reuse between calls. Index memory is larger than the cached vocabulary text size. Python callers can inspect `engine.request_cache_info()` or clear both caches with `engine.clear_request_cache()`.
+
+See the [request options guide](docs/request_options.md) for per-audio overrides, cache behavior and benchmarking.
 
 The original Transformers entry point is `infer_ctc.py`; configure its hotword settings in the script and set `MODEL_PATH`, `MODE`, and optionally `TEST_JSON` via environment variables.
 
@@ -109,7 +127,7 @@ The vLLM adapter supports a **single GPU** and an **unquantized, merged checkpoi
 
 Audio encoding and CTC run in microbatches (`--prepare-batch-size 4`). For larger batches, CPU hotword retrieval overlaps preparation of the next microbatch. Features stay on the worker GPU by default; only IDs and lengths cross the process boundary. A 256 MiB request cache is released after generation, including on errors. `--embedding-transport cpu` provides the original feature-transfer path for comparison. `--batch-size` controls the number of utterances submitted together for final decoding.
 
-Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), including for single audio. Use `--rag-workers 1` for serial scoring. Matching scores and candidate order are preserved; each score matrix is limited to 16 MiB.
+Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), including for single audio; small workloads automatically use serial scoring. Use `--rag-workers 1` to always score serially. Matching scores and candidate order are preserved; each score matrix is limited to 16 MiB.
 
 Weighted refinement uses Numba when available (`--rag-refiner auto`, the default). Vocabulary loading prepares the compiled kernel before inference. Select `python` or `numba` explicitly for comparisons. The vLLM extra includes Numba; standalone hotword users can install `.[rag-native]`.
 
