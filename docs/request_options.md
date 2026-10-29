@@ -3,7 +3,8 @@
 `VLLMContextASR` accepts a vocabulary and limits for each audio. In `ctc_rag`
 mode, request hotwords replace the engine's `hot_txt` vocabulary for that audio;
 they are candidates for phoneme retrieval, not an unconditional prompt. In
-`asr` mode they are sent directly as prompt words. Pure `ctc` mode has no
+`asr` mode the target of each entry is sent as a prompt word; aliases and
+blacklists are not applied. Pure `ctc` mode has no
 hotword retrieval or text generation and rejects these request options.
 
 ```python

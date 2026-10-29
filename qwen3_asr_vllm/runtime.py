@@ -9,7 +9,8 @@ from threading import Lock
 import numpy as np
 
 from . import ARCHITECTURE, register
-from .requests import RequestPhonemeCache, RequestVocabularyCache, normalize_options, validate_mode_options
+from .requests import (RequestPhonemeCache, RequestVocabularyCache, hotword_target,
+                       normalize_options, validate_mode_options)
 from utils.asr_metrics import transcript_text
 
 
@@ -235,11 +236,13 @@ class VLLMContextASR:
                 for (index, limit), result in zip(members, retrieval):
                     selected[index] = select_hotwords(result, limit)
         for index, item in enumerate(items):
-            hotwords = list(options[index].hotwords or ())
             if self.mode == "ctc_rag":
                 hotwords = selected[index]
-            elif options[index].max_ctx_hotwords is not None:
-                hotwords = hotwords[:options[index].max_ctx_hotwords]
+            else:
+                hotwords = [target for entry in options[index].hotwords or ()
+                            if (target := hotword_target(entry)) is not None]
+                if options[index].max_ctx_hotwords is not None:
+                    hotwords = hotwords[:options[index].max_ctx_hotwords]
             item["hotwords"] = hotwords
             if self.mode != "ctc":
                 system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""

@@ -107,6 +107,14 @@ class VLLMRuntimeTest(unittest.TestCase):
         self.assertEqual(messages[0]["content"], "可能出现的热词：手工热词")
         runtime._corrector.correct.assert_not_called()
 
+    def test_asr_prompt_uses_targets_not_aliases_or_blacklists(self):
+        runtime, _, _ = self.make_runtime("asr")
+        runtime.transcribe(np.zeros(1600),
+                           hotwords=["康辉|康灰~~~杭州", " | 广州 | 广洲", "~~~无目标", "上海"],
+                           max_ctx_hotwords=2)
+        messages = runtime._processor.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages[0]["content"], "可能出现的热词：康辉，广州")
+
     def test_retrieval_overlaps_next_gpu_batch_and_preserves_order(self):
         runtime, worker, _ = self.make_runtime("ctc_rag")
         runtime.prepare_batch_size = 1

@@ -65,6 +65,12 @@ def validate_mode_options(mode, options):
         raise ValueError("Request hotwords and generation options require asr or ctc_rag mode.")
 
 
+def hotword_target(entry):
+    """Return the target from a target|alias~~~blacklist entry, if present."""
+    terms = entry.split("~~~", 1)[0].split("|")
+    return next((term.strip() for term in terms if term.strip()), None)
+
+
 class RequestVocabularyCache:
     """LRU bounded by entries and vocabulary text bytes, not total object memory.
 
