@@ -105,6 +105,97 @@ class TransformersInferenceTest(unittest.TestCase):
             self.assertEqual(cer, 0)
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["err"], 0)
 
+    def test_file_rejects_output_aliasing_a_later_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            audio = root / "input.wav"
+            original = b"audio must remain intact"
+            audio.write_bytes(original)
+            symlink = root / "symbolic.jsonl"
+            symlink.symlink_to(audio)
+            hardlink = root / "hard.jsonl"
+            os.link(audio, hardlink)
+            source = root / "input.jsonl"
+            source.write_text("".join(json.dumps({"audios": [path]}) + "\n"
+                                      for path in ("other.wav", str(audio))))
+            for output in (audio, symlink, hardlink):
+                with self.subTest(output=output), patch.object(infer_ctc, "transcribe") as transcribe:
+                    with self.assertRaisesRegex(ValueError, "different files"):
+                        infer_ctc.run_file(None, None, str(source), mode="asr", out_json=str(output))
+                    transcribe.assert_not_called()
+                    self.assertEqual(audio.read_bytes(), original)
+
+    def run_file_case(self, references, outcomes, mode="asr"):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, output = root / "input.jsonl", root / "output.jsonl"
+            rows = []
+            for index, reference in enumerate(references):
+                row = {"audios": [f"{index}.wav"]}
+                if reference is not None:
+                    row["messages"] = [{"role": "assistant", "content": reference}]
+                rows.append(row)
+            source.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                              encoding="utf-8")
+            log = io.StringIO()
+            with patch.object(infer_ctc, "transcribe", side_effect=outcomes), contextlib.redirect_stdout(log):
+                cer = infer_ctc.run_file(None, None, str(source), mode=mode, out_json=str(output))
+            records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            return cer, records, log.getvalue()
+
+    def test_file_excludes_missing_references_from_cer(self):
+        cer, records, _ = self.run_file_case(
+            ["你好", None], [{"text": "你好"}, {"text": "你好"}],
+        )
+        self.assertEqual(cer, 0)
+        self.assertEqual(records[0]["ref_len"], 2)
+        self.assertIsNone(records[1]["ref"])
+        self.assertIsNone(records[1]["err"])
+        self.assertIsNone(records[1]["ref_len"])
+        self.assertEqual(records[1]["status"], "ok")
+
+    def test_file_preserves_explicit_empty_reference_as_scored(self):
+        cer, records, _ = self.run_file_case(
+            ["你好", ""], [{"text": "你好"}, {"text": "你好"}],
+        )
+        self.assertEqual(cer, 1)
+        self.assertEqual(records[1]["err"], 2)
+        self.assertEqual(records[1]["ref_len"], 0)
+
+    def test_file_records_failure_separately_and_continues_scoring(self):
+        cer, records, log = self.run_file_case(
+            ["你好", "你好", "你好"],
+            [{"text": ""}, FileNotFoundError("missing.wav"), {"text": "你好"}],
+            mode="ctc_rag",
+        )
+        self.assertEqual(cer, 0.5)
+        self.assertEqual(records[0]["status"], "ok")
+        self.assertEqual(records[0]["hyp"], "")
+        self.assertEqual(records[0]["err"], 2)
+        self.assertNotIn("error", records[0])
+        self.assertEqual(records[1]["status"], "error")
+        self.assertEqual(records[1]["error"], {"type": "FileNotFoundError", "message": "missing.wav"})
+        self.assertIsNone(records[1]["hyp"])
+        self.assertIsNone(records[1]["err"])
+        self.assertIsNone(records[1]["ref_len"])
+        self.assertEqual(records[2]["err"], 0)
+        self.assertIn("失败样本      : 1", log)
+        self.assertIn("参与 CER 样本 : 2", log)
+
+    def test_file_reports_no_cer_when_no_reference_characters_can_be_scored(self):
+        for references, outcomes in (
+            ([None], [{"text": "你好"}]),
+            (["你好"], [FileNotFoundError("missing.wav")]),
+            ([None], [FileNotFoundError("missing.wav")]),
+            ([""], [{"text": "你好"}]),
+            ([], []),
+            ([None] * 50, [{"text": "你好"}] * 50),
+        ):
+            with self.subTest(references=references):
+                cer, _, log = self.run_file_case(references, outcomes)
+                self.assertIsNone(cer)
+                self.assertIn("CER           : N/A", log)
+
 
 if __name__ == "__main__":
     unittest.main()

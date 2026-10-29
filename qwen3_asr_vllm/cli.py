@@ -4,10 +4,12 @@ import argparse
 import json
 import os
 import time
+from itertools import chain
 from pathlib import Path
 
 from .runtime import VLLMContextASR
 from utils.asr_metrics import cer_counts
+from utils.inference_io import ensure_output_not_input
 
 
 def build_parser():
@@ -63,12 +65,15 @@ def main(argv=None):
     out_path = args.out_json
     if out_path is None and args.test_json:
         out_path = args.test_json.with_name(f"{args.test_json.stem}_{args.mode}_vllm.jsonl")
-    if args.test_json and out_path:
-        same_path = args.test_json.resolve() == out_path.resolve()
-        if not same_path and args.test_json.exists() and out_path.exists():
-            same_path = args.test_json.samefile(out_path)
-        if same_path:
-            parser.error("--out-json must not refer to the --test-json input file.")
+    if out_path:
+        # Scan the entire manifest before opening output, including later batches.
+        inputs = [args.audio] if args.audio else chain(
+            [args.test_json], (sample["wav"] for sample in iter_samples(args.test_json))
+        )
+        try:
+            ensure_output_not_input(out_path, inputs)
+        except ValueError as exc:
+            parser.error(str(exc))
     engine = VLLMContextASR(
         args.model,
         mode=args.mode,

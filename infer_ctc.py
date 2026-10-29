@@ -16,6 +16,7 @@ import warnings
 import torch
 from qwen_omni_utils import process_mm_info
 from utils.asr_metrics import transcript_text
+from utils.inference_io import ensure_output_not_input
 
 # ============================ 配置 ============================
 MODEL_PATH = os.environ.get("MODEL_PATH", "")
@@ -281,10 +282,10 @@ def _iter_jsonl(path):
             if not line:
                 continue
             obj = json.loads(line)
-            ref = ""
+            ref = None
             for msg in obj.get("messages", []):
                 if msg.get("role") == "assistant":
-                    ref = msg.get("content", "")
+                    ref = msg.get("content")
             wav = obj["audios"][0]
             uttid = obj.get("uttid", os.path.splitext(os.path.basename(wav))[0])
             yield wav, ref, uttid
@@ -297,50 +298,62 @@ def _default_out_json(test_json, mode):
 
 def run_file(model, processor, test_json, *, mode=MODE, vocab=None, pc=None,
              out_json="", use_audio_in_video=True):
-    """批量推理 jsonl 文件, 逐条写结果并计算整体 CER。"""
+    """逐条记录结果与失败；仅对成功且有参考的样本算 CER，无分母时返回 None。"""
     out_json = out_json or _default_out_json(test_json, mode)
-    # Resolve symlinks and also catch distinct hard links to the same inode.
-    from pathlib import Path
-    input_path, output_path = Path(test_json), Path(out_json)
-    if input_path.resolve() == output_path.resolve() or (
-        input_path.exists() and output_path.exists() and os.path.samefile(input_path, output_path)
-    ):
-        raise ValueError("Input and output JSONL must be different files.")
-    total_err = total_ref = n = 0
+    from itertools import chain
+
+    # Check all audio paths before output is opened, without holding the manifest in memory.
+    ensure_output_not_input(out_json, chain(
+        [test_json], (wav for wav, _, _ in _iter_jsonl(test_json))
+    ))
+    total_err = total_ref = n = scored = failed = 0
     t0 = time.time()
     print(f"[file] 推理 {test_json}\n[file] mode={mode}  "
           f"输出 -> {out_json}", flush=True)
     with open(out_json, "w", encoding="utf-8") as fout:
         for wav, ref, uttid in _iter_jsonl(test_json):
+            error = None
             try:
                 out = transcribe(model, processor, wav, mode=mode, vocab=vocab, pc=pc,
                                  use_audio_in_video=use_audio_in_video)
                 hyp = out.get("text", "")
             except Exception as e:  # noqa: BLE001
-                out, hyp = {"mode": mode, "text": ""}, ""
+                out, hyp = {}, None
+                error = {"type": type(e).__name__, "message": str(e)}
+                failed += 1
                 print(f"[ERR] {wav}: {e}", flush=True)
-            r, h = _norm_cer(ref), _norm_cer(hyp)
-            dist = _edit_distance(r, h)
-            total_err += dist
-            total_ref += len(r)
             n += 1
             rec = {"uttid": uttid, "wav": wav, "ref": ref, "hyp": hyp,
-                   "err": dist, "ref_len": len(r)}
+                   "status": "error" if error else "ok", "err": None, "ref_len": None}
+            if error:
+                rec["error"] = error
+            elif ref is not None:
+                r, h = _norm_cer(ref), _norm_cer(hyp)
+                dist = _edit_distance(r, h)
+                total_err += dist
+                total_ref += len(r)
+                scored += 1
+                rec.update(err=dist, ref_len=len(r))
             if mode == "ctc_rag":
                 rec["rough"] = out.get("rough", "")
                 rec["hotwords"] = out.get("hotwords", [])
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             if n % 50 == 0:
                 fout.flush()
-                print(f"[{n}] CER={total_err / max(total_ref, 1):.4f}  "
+                cer_text = f"{total_err / total_ref:.4f}" if total_ref else "N/A"
+                print(f"[{n}] CER={cer_text} scored={scored} failed={failed}  "
                       f"({n / (time.time() - t0):.2f} utt/s)", flush=True)
-    cer = total_err / max(total_ref, 1)
+    cer = total_err / total_ref if total_ref else None
     dt = time.time() - t0
     print("=" * 50)
     print(f"样本数        : {n}")
+    print(f"成功样本      : {n - failed}")
+    print(f"失败样本      : {failed}")
+    print(f"参与 CER 样本 : {scored}")
     print(f"总参考字符    : {total_ref}")
     print(f"总编辑距离    : {total_err}")
-    print(f"CER           : {cer:.4f} ({cer * 100:.2f}%)")
+    cer_text = f"{cer:.4f} ({cer * 100:.2f}%)" if cer is not None else "N/A"
+    print(f"CER           : {cer_text}")
     print(f"耗时          : {dt:.1f}s ({n / max(dt, 1e-9):.2f} utt/s)")
     print(f"逐条结果      : {out_json}", flush=True)
     return cer

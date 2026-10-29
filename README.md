@@ -81,6 +81,8 @@ CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
 
 The original Transformers entry point is `infer_ctc.py`; configure its hotword settings in the script and set `MODEL_PATH`, `MODE`, and optionally `TEST_JSON` via environment variables.
 
+Both inference entry points reject output paths that alias the input manifest or any input audio, including symbolic and hard links. In `infer_ctc.py`, each batch result has a `status` (`ok` or `error`); failures include the exception type and message in `error` and use `hyp: null`. CER counts only successful records with a reference transcript. Missing references and failed records have `err: null` and `ref_len: null`; an explicitly empty reference still counts insertions. The console reports failed and scored sample counts separately. When there are no scored reference characters, CER is `N/A` and `run_file` returns `None`.
+
 ## 🏋️ Training
 
 The [ms-swift + AISHELL-1 guide](docs/ms_swift_aishell.md) (Chinese) covers data preparation, hotword-aware SFT, CTC-only training, checkpoint export, and vLLM inference. It starts from the official Qwen3-ASR-0.6B base model. Use AISHELL-1 **train** for training and reserve the SeACo dev/test subsets for evaluation.
