@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from qwen3_asr_vllm.runtime import VLLMContextASR, select_hotwords
+from qwen3_asr_vllm.requests import RequestPhonemeCache, RequestVocabularyCache
 from qwen3_asr_vllm.transport import EmbeddingCache, pack_embeddings, unpack_embeddings
 
 
@@ -27,11 +28,18 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime.max_audio_samples = 16000
         runtime.prepare_batch_size = 2
         runtime.embedding_transport = transport
+        runtime.rag_workers = 4
+        runtime._request_cache = RequestVocabularyCache()
+        runtime._request_phonemes = RequestPhonemeCache(max_entries=0)
+        runtime._last_rag_refiners = set()
         runtime.max_ctx_hotwords = 8
         runtime.sampling_params = object()
         runtime._lock = Lock()
         runtime._processor = SimpleNamespace(apply_chat_template=Mock(side_effect=lambda messages, **kw: str(messages)))
-        runtime._corrector = SimpleNamespace(correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
+        runtime._corrector = SimpleNamespace(refiner_backend="python", correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
+        runtime._corrector.correct_batch = Mock(side_effect=lambda texts, k, workers: [
+            runtime._corrector.correct(text, k=k) for text in texts
+        ])
         features = torch.randn(13, 8)
         next_id = 0
 
@@ -63,6 +71,11 @@ class VLLMRuntimeTest(unittest.TestCase):
         self.assertEqual([item["rough"] for item in outputs], ["粗转写1", "粗转写2", "粗转写3"])
         self.assertTrue(all(item["hotwords"] == ["热词"] for item in outputs))
         self.assertEqual(worker.context_prepare_batch.call_count, 2)
+        self.assertEqual(runtime._corrector.correct_batch.call_count, 2)
+        self.assertEqual(runtime._corrector.correct_batch.call_args_list[0].args[0],
+                         ["粗转写1", "粗转写2"])
+        self.assertEqual(runtime._corrector.correct_batch.call_args_list[0].kwargs,
+                         {"k": 8, "workers": 4})
         sent_audio = worker.context_prepare_batch.call_args_list[0].args[0]
         for data, wave in zip(sent_audio, waves):
             np.testing.assert_array_equal(np.frombuffer(data, dtype=np.float32), wave)
@@ -94,6 +107,14 @@ class VLLMRuntimeTest(unittest.TestCase):
         messages = runtime._processor.apply_chat_template.call_args.args[0]
         self.assertEqual(messages[0]["content"], "可能出现的热词：手工热词")
         runtime._corrector.correct.assert_not_called()
+
+    def test_asr_prompt_uses_targets_not_aliases_or_blacklists(self):
+        runtime, _, _ = self.make_runtime("asr")
+        runtime.transcribe(np.zeros(1600),
+                           hotwords=["康辉|康灰~~~杭州", " | 广州 | 广洲", "~~~无目标", "上海"],
+                           max_ctx_hotwords=2)
+        messages = runtime._processor.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages[0]["content"], "可能出现的热词：康辉，广州")
 
     def test_retrieval_overlaps_next_gpu_batch_and_preserves_order(self):
         runtime, worker, _ = self.make_runtime("ctc_rag")
@@ -153,6 +174,149 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime, _, _ = self.make_runtime("ctc_rag")
         self.assertEqual(runtime.transcribe_batch([]), [])
         runtime.llm.collective_rpc.assert_not_called()
+
+    def test_wrong_retrieval_result_count_releases_contexts(self):
+        runtime, worker, _ = self.make_runtime("ctc_rag")
+        runtime._corrector.correct_batch.side_effect = None
+        runtime._corrector.correct_batch.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "Retriever returned"):
+            runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+        worker.context_release.assert_called_once_with([1, 2])
+        runtime.llm.generate.assert_not_called()
+
+    def test_zero_hotword_limit_skips_retrieval(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime.max_ctx_hotwords = 0
+        outputs = runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+        runtime._corrector.correct_batch.assert_not_called()
+        self.assertEqual([item["hotwords"] for item in outputs], [[], []])
+
+    def test_request_vocabularies_limits_and_cache_are_isolated(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+
+        def make_corrector(words):
+            return SimpleNamespace(refiner_backend="numba", correct_batch=Mock(side_effect=lambda texts, k, workers: [
+                SimpleNamespace(matches=[], similars=[("", word, 1) for word in words][:k])
+                for _ in texts
+            ]))
+
+        runtime._create_request_corrector = Mock(side_effect=make_corrector)
+        waves = [np.zeros(1600) for _ in range(5)]
+        options = [
+            {"hotwords": ["甲", "乙"], "max_ctx_hotwords": 1},
+            {"hotwords": ["甲", "乙"], "max_ctx_hotwords": 2},
+            {"hotwords": ["丙"]},
+            {"hotwords": []},
+            {},
+        ]
+        outputs = runtime.transcribe_batch(waves, request_options=options)
+        self.assertEqual(runtime.last_rag_refiner_backends(), ["numba", "python"])
+        self.assertEqual([item["hotwords"] for item in outputs],
+                         [["甲"], ["甲", "乙"], ["丙"], [], ["热词"]])
+        self.assertEqual(runtime._create_request_corrector.call_count, 2)
+        runtime.transcribe(np.zeros(1600), hotwords=["甲", "乙"])
+        self.assertEqual(runtime._create_request_corrector.call_count, 2)
+        self.assertEqual(runtime.request_cache_info()["hits"], 1)
+        self.assertEqual(runtime.transcribe(np.zeros(1600))["hotwords"], ["热词"])
+        self.assertEqual(runtime.last_rag_refiner_backends(), ["python"])
+
+        shared = runtime.transcribe_batch(
+            [np.zeros(1600), np.zeros(1600)], hotwords=["共享"],
+            request_options=[{}, {"hotwords": None}],
+        )
+        self.assertEqual([item["hotwords"] for item in shared], [["共享"], ["热词"]])
+        runtime.clear_request_cache()
+        self.assertEqual(runtime.request_cache_info()["entries"], 0)
+        self.assertEqual(runtime.request_cache_info()["hits"], 0)
+
+    def test_request_generation_limits_do_not_modify_engine_defaults(self):
+        runtime, _, _ = self.make_runtime("asr")
+
+        class Sampling:
+            def __init__(self, max_tokens):
+                self.max_tokens = max_tokens
+
+            def clone(self):
+                return Sampling(self.max_tokens)
+
+        runtime.sampling_params = Sampling(512)
+        runtime.transcribe_batch([np.zeros(1600), np.zeros(1600)], request_options=[
+            {"hotwords": ["甲", "乙"], "max_ctx_hotwords": 1, "max_new_tokens": 8},
+            {"hotwords": ["丙"], "max_new_tokens": 12},
+        ])
+        requests, sampling = runtime.llm.generate.call_args.args
+        self.assertIn("甲", requests[0]["prompt"])
+        self.assertNotIn("乙", requests[0]["prompt"])
+        self.assertIn("丙", requests[1]["prompt"])
+        self.assertEqual([value.max_tokens for value in sampling], [8, 12])
+        self.assertEqual(runtime.sampling_params.max_tokens, 512)
+
+    def test_invalid_request_options_fail_before_gpu_work(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        bad = [[], [{"hotwords": "广州"}], [{"hotwords": ["a\nb"]}],
+               [{"hotwords": ["a\u2028b"]}], [{1: True}],
+               [{"max_ctx_hotwords": -1}], [{"max_new_tokens": True}], [{"unknown": 1}]]
+        for options in bad:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                runtime.transcribe_batch([np.zeros(1600)], request_options=options)
+        runtime.llm.collective_rpc.assert_not_called()
+
+    def test_ctc_rejects_unused_request_parameters(self):
+        runtime, _, _ = self.make_runtime("ctc")
+        with self.assertRaisesRegex(ValueError, "require asr or ctc_rag"):
+            runtime.transcribe(np.zeros(1600), hotwords=["广州"])
+        runtime.llm.collective_rpc.assert_not_called()
+
+    def test_reuses_request_vocab_across_microbatches_with_cache_disabled(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime.prepare_batch_size = 1
+        runtime._request_cache = RequestVocabularyCache(max_entries=0)
+        corrector = SimpleNamespace(refiner_backend="python", correct_batch=Mock(side_effect=lambda texts, k, workers: [
+            SimpleNamespace(matches=[], similars=[("", "甲", 1)]) for _ in texts
+        ]))
+        runtime._create_request_corrector = Mock(return_value=corrector)
+        outputs = runtime.transcribe_batch([np.zeros(1600), np.zeros(1600)], hotwords=["甲"])
+        self.assertEqual([item["hotwords"] for item in outputs], [["甲"], ["甲"]])
+        runtime._create_request_corrector.assert_called_once_with(("甲",))
+        self.assertEqual(runtime.request_cache_info()["entries"], 0)
+        runtime.transcribe(np.zeros(1600), hotwords=["甲"])
+        self.assertEqual(runtime._create_request_corrector.call_count, 2)
+
+    def test_request_vocabulary_failure_releases_encoded_audio(self):
+        runtime, worker, _ = self.make_runtime("ctc_rag")
+        runtime._create_request_corrector = Mock(side_effect=RuntimeError("vocabulary failed"))
+        with self.assertRaisesRegex(RuntimeError, "vocabulary failed"):
+            runtime.transcribe_batch([np.zeros(1600), np.zeros(1600)], hotwords=["甲"])
+        worker.context_release.assert_called_once_with([1, 2])
+        runtime.llm.generate.assert_not_called()
+
+    def test_invalid_retrieval_workers_fail_before_engine_start(self):
+        for workers in (0, -1, True, 1.5):
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, "rag_workers"):
+                VLLMContextASR("unused", rag_workers=workers)
+
+
+class RequestVocabularyCacheTest(unittest.TestCase):
+    def test_failed_build_preserves_cached_vocabulary(self):
+        cache = RequestVocabularyCache(max_entries=2)
+        original = cache.get(("a",), lambda words: object())
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            cache.get(("b",), Mock(side_effect=RuntimeError("failed")))
+        self.assertIs(cache.get(("a",), lambda words: object()), original)
+        self.assertEqual(cache.info()["entries"], 1)
+
+    def test_lru_limits_and_oversized_requests(self):
+        cache = RequestVocabularyCache(max_entries=2, max_text_bytes=10)
+        factory = Mock(side_effect=lambda words: object())
+        a = cache.get(("a",), factory)
+        cache.get(("b",), factory)
+        self.assertIs(cache.get(("a",), factory), a)
+        cache.get(("c",), factory)
+        cache.get(("b",), factory)
+        self.assertEqual(factory.call_count, 4)
+        cache.get(("oversized-vocabulary",), factory)
+        self.assertEqual(cache.info(), {"entries": 2, "vocabulary_text_bytes": 4,
+                                        "hits": 1, "misses": 5})
 
 
 class EmbeddingCacheTest(unittest.TestCase):

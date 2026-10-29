@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--audio", type=Path, nargs="+", required=True)
     parser.add_argument("--hot-txt", type=Path)
+    parser.add_argument("--request-hot-txt", type=Path, help="Use these hotwords as a request-specific vocabulary")
+    parser.add_argument("--request-cache-size", type=int, default=8)
     parser.add_argument("--mode", choices=("asr", "ctc", "ctc_rag"), default="ctc_rag")
     parser.add_argument("--max-ctx-hotwords", type=int, default=10)
     parser.add_argument("--ablation", action="store_true",
@@ -26,6 +28,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--prepare-batch-size", type=int)
+    parser.add_argument("--rag-workers", type=int, help="Native CPU retrieval workers; 1 selects serial scoring")
+    parser.add_argument("--rag-refiner", choices=("auto", "python", "numba"))
     parser.add_argument("--embedding-transport", choices=("device", "cpu"))
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -37,12 +41,25 @@ def main():
         parser.error("Batch sizes/repeats must be positive and warmup nonnegative.")
     if args.max_ctx_hotwords < 0 or (args.ablation and args.max_ctx_hotwords == 0):
         parser.error("Hotword limit must be nonnegative (positive for ablation).")
-    ensure_output_not_input(args.output, [*args.audio, *([args.hot_txt] if args.hot_txt else [])])
+    if args.rag_workers is not None and args.rag_workers < 1:
+        parser.error("--rag-workers must be positive.")
+    if args.request_cache_size < 0:
+        parser.error("--request-cache-size must be nonnegative.")
+    if args.request_hot_txt is not None and (args.ablation or args.mode == "ctc"):
+        parser.error("--request-hot-txt requires asr or ctc_rag without --ablation.")
+    inputs = [*args.audio, *([args.hot_txt] if args.hot_txt else []),
+              *([args.request_hot_txt] if args.request_hot_txt else [])]
+    ensure_output_not_input(args.output, inputs)
     extra = {}
+    extra["request_cache_size"] = args.request_cache_size
     if args.prepare_batch_size is not None:
         extra["prepare_batch_size"] = args.prepare_batch_size
     if args.embedding_transport is not None:
         extra["embedding_transport"] = args.embedding_transport
+    if args.rag_workers is not None:
+        extra["rag_workers"] = args.rag_workers
+    if args.rag_refiner is not None:
+        extra["rag_refiner"] = args.rag_refiner
     engine = VLLMContextASR(
         args.model, mode="ctc_rag" if args.ablation else args.mode,
         hot_txt=args.hot_txt, max_ctx_hotwords=args.max_ctx_hotwords,
@@ -53,11 +70,19 @@ def main():
         disable_log_stats=True, **extra,
     )
     waveforms = [read_audio(path) for path in args.audio]
+    request_words = None
+    if args.request_hot_txt is not None:
+        request_words = [line.strip() for line in args.request_hot_txt.read_text(encoding="utf-8").splitlines()
+                         if line.strip() and not line.strip().startswith("#")]
     report = {"vllm": version("vllm"), "model": args.model,
               "audio": [str(path) for path in args.audio],
               "hot_txt": str(args.hot_txt) if args.hot_txt else None,
+              "request_hot_txt": str(args.request_hot_txt) if args.request_hot_txt else None,
+              "request_cache_size": args.request_cache_size,
               "prepare_batch_size": getattr(engine, "prepare_batch_size", None),
               "embedding_transport": getattr(engine, "embedding_transport", None),
+              "rag_workers": getattr(engine, "rag_workers", None),
+              "rag_refiner": engine.rag_refiner,
               "max_model_len": args.max_model_len,
               "max_new_tokens": args.max_new_tokens,
               "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -73,25 +98,31 @@ def main():
     rng = random.Random(42)
     for size in args.batch_sizes:
         batch = [waveforms[index % len(waveforms)] for index in range(size)]
-        measured = {name: {"seconds": []} for name, _, _ in cases}
+        measured = {name: {"seconds": [], "refiner_backends": set()} for name, _, _ in cases}
         for _, mode, limit in cases:
             engine.mode, engine.max_ctx_hotwords = mode, limit
+            options = ([{"max_ctx_hotwords": limit} for _ in batch]
+                       if mode == "asr" and request_words is not None else None)
             for _ in range(args.warmup):
-                engine.transcribe_batch(batch)
+                engine.transcribe_batch(batch, hotwords=request_words, request_options=options)
         for _ in range(args.repeats):
             order = list(cases)
             rng.shuffle(order)
             for name, mode, limit in order:
                 engine.mode, engine.max_ctx_hotwords = mode, limit
+                options = ([{"max_ctx_hotwords": limit} for _ in batch]
+                           if mode == "asr" and request_words is not None else None)
                 start = time.perf_counter()
-                results = engine.transcribe_batch(batch)
+                results = engine.transcribe_batch(batch, hotwords=request_words, request_options=options)
                 measured[name]["seconds"].append(time.perf_counter() - start)
+                measured[name]["refiner_backends"].update(engine.last_rag_refiner_backends())
                 measured[name]["results"] = results
         audio_seconds = sum(len(wave) for wave in batch) / 16000
         for name, mode, limit in cases:
             timings = measured[name]["seconds"]
             report["runs"].append({
                 "case": name, "mode": mode, "max_ctx_hotwords": limit,
+                "rag_refiner_backends": sorted(measured[name]["refiner_backends"]),
                 "batch": size, "batch_audio_seconds": audio_seconds,
                 "seconds": timings, "p50_ms": float(np.percentile(timings, 50) * 1000),
                 "p95_ms": float(np.percentile(timings, 95) * 1000),
@@ -100,6 +131,7 @@ def main():
                 "results": measured[name]["results"],
             })
     report["stats"] = engine.runtime_stats()
+    report["request_cache"] = engine.request_cache_info()
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False))
 

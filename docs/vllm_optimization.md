@@ -157,8 +157,8 @@ coarse scoring takes 153.6 ms with sequential `extract`, versus 143.5 / 76.1 /
 match exactly on those inputs. These timings include matrix filtering and
 ranking, but exclude alignment/masking, weighted refinement, and ASR. The
 3.7x coarse-stage improvement is therefore **not an end-to-end speedup**.
-This prototype is not enabled in the runtime; integrating it requires a batch
-retrieval API and broader ranking/threshold, concurrency and end-to-end checks.
+That prototype only parallelized across utterances. The integrated version
+below also parallelizes across vocabulary entries, including for single audio.
 Another option is moving weighted refinement out of Python. Python threads
 alone cannot parallelize that loop while it holds the GIL.
 
@@ -168,6 +168,252 @@ eight audio paths to `--audio`. For a single path, use `--mode asr`, `--mode ctc
 or `--mode ctc_rag`; `--mode ctc_rag --max-ctx-hotwords 0` runs CTC without
 retrieval. Raw reports, query comparisons and logs are saved locally under
 `artifacts/context-optimization/round2/` (excluded from Git).
+
+## Native CPU retrieval and GPU tradeoffs
+
+The 68 ms retrieval figure above comes from an earlier public-audio profile;
+it is not a fixed cost for every input. Vocabulary size, phoneme length and
+the number of coarse matches determine the work. This retrieval operates on
+phoneme sequences: text normalization/pinyin conversion, full-vocabulary fuzzy
+scoring, alignment and masking with OSA distance, then weighted edit-distance
+refinement with word boundaries, aliases and contextual blacklists.
+
+The integrated CPU optimization adds `PhonemeCorrector.correct_batch` and
+`FastRAG.search_batch`. Native RapidFuzz `cdist` workers divide the vocabulary
+dimension, so one utterance can also use multiple cores. `partial_ratio`
+scores are symmetric; alignment/masking retains the original input/hotword
+orientation. Float64 scores and stable sorting retain scalar ranking and ties.
+The accelerated path holds one vocabulary/blacklist snapshot for the microbatch;
+`workers=1` retains the original per-utterance serial behavior. Score matrices
+are chunked to at most 16 MiB each, with scalar fallback if a single query would
+exceed that budget. Each call uses at most `--rag-workers` native workers
+(default 4), rather than all available CPU cores.
+
+Measured on physical GPU 3 (A800-SXM4-80GB) with the same completed 0.6B
+checkpoint, eight AISHELL dev inputs, 12,286-term vocabulary, preparation
+microbatch 4, compiled vLLM 0.22.1, disabled prefix caching, model length 1024,
+96-token generation cap and GPU memory utilization 0.12. CPU worker counts
+1 / 2 / 4 are shuffled within each of fifteen timed rounds after three warmup
+batches per case, in one resident engine. Audio reading and startup are excluded.
+
+| Batch | Serial retrieval P50 | 4-worker retrieval P50 | Serial full pipeline P50 | 4-worker full pipeline P50 | Full pipeline reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 51.2 ms | 38.8 ms | 96.7 ms | 84.3 ms | 12.8% |
+| 4 | 189.3 ms | 116.9 ms | 263.9 ms | 191.5 ms | 27.4% |
+| 8 | 358.9 ms | 234.9 ms | 453.5 ms | 329.3 ms | 27.4% |
+
+Times are for the whole batch. Retrieval phase medians sum the retrieval calls
+within a request; preparation can overlap those calls. For the single input,
+serial → 4-worker phase P50 is approximately: phoneme conversion 0.54 → 0.54 ms,
+coarse scoring 22.44 → 9.16 ms, alignment 5.41 → 5.41 ms, weighted refinement
+22.67 → 22.56 ms. Phase medians need not sum to the total median.
+Weighted refinement is now the largest remaining retrieval stage.
+
+All timed cases produce identical CTC text, ranked hotwords and final
+transcriptions. Full correction results also match the preceding source
+snapshot on 135 queries (134 distinct), with another 1,100 randomized retrieval
+queries covering long phoneme sequences and varied cutoffs. Unit checks cover
+aliases, blacklists, vocabulary replacement, empty inputs, ties, matrix memory
+limits, overlap, and cleanup on errors. Validation passed 61 general CPU checks,
+eight phoneme/compatibility checks in the inference environment, and six real
+GPU integration tests with default compilation/CUDA Graphs. These small measurements establish P50
+improvements, not corpus accuracy or concurrent-serving guarantees. In
+particular, single-input P95 was 108.2 ms serial versus 109.7 ms with four
+workers; a tail-latency improvement has not been demonstrated.
+
+Pass `--rag-workers 1` or `--rag-workers 4` to either `infer_vllm.py` or
+`scripts/benchmark_vllm.py` for serial/native scoring. Reports and the resident
+engine comparison script are stored locally in
+`artifacts/context-optimization/round3/` (excluded from Git).
+
+### Why CPU, and what would GPU execution require?
+
+From the implementation, the engineering advantages of CPU retrieval are
+reuse of RapidFuzz and pinyin/string-processing libraries, direct handling of
+variable-length text and rule checks, and overlap with other audio's GPU
+encoding. This is an explanation of the current structure, not a documented
+statement of the upstream author's intent. RapidFuzz's native scorers can
+release the GIL and use CPU workers; the Python refinement loop still runs
+serially. See the [RapidFuzz process API](https://rapidfuzz.github.io/RapidFuzz/Usage/process.html).
+
+GPU string matching is possible: [NVIDIA cuDF exposes Levenshtein edit
+distance](https://docs.nvidia.com/cudf/26.10/cudf/api_docs/api/cudf.core.accessors.string.StringMethods.edit_distance/).
+That primitive does not implement this pipeline's partial-ratio/OSA filtering,
+phoneme-specific costs, start/end constraints and stable candidate selection.
+Replacing these with plain edit distance changes the retrieval algorithm.
+
+A compatible GPU path would pre-encode the vocabulary, pack variable-length
+phoneme IDs and boundary flags, and batch coarse scoring or weighted refinement
+in a CUDA/Triton kernel. Pinyin conversion and blacklist processing can remain
+on the CPU; the measured conversion cost is only around 0.5 ms for this input.
+Integration must schedule the new kernel in the vLLM worker and measure its
+RPC/synchronization costs and contention with encoding/decoding. Keeping the
+dictionary resident and batching transfers/kernels follows the [CUDA best
+practices guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html).
+Neither a GPU implementation nor a GPU speedup is established by the current
+CPU measurements. Native weighted refinement is implemented below; a compatible
+GPU refinement kernel remains another possible approach.
+
+## Native weighted refinement
+
+Weighted edit-distance refinement now has a Numba CPU backend. It compiles the
+two-row dynamic-programming loop to native code with `nogil=True`, float64
+arithmetic and no fast-math transformations. The vocabulary encodes each alias's
+phonemes once. Each query computes substitution costs for the selected targets
+and unique source phonemes, then reuses them across candidate windows. English
+LCS costs, tone/mixed-language handling, boundary flags, pruning and stable
+score ties follow the Python matcher. Query results are recomputed on each call.
+
+`--rag-refiner auto` is the default; it uses Numba when available, falling back
+to Python if the dependency is unavailable or JIT is disabled. `python` forces
+the reference implementation; `numba` explicitly requires native refinement.
+The vLLM dependency extra includes `numba>=0.61`; standalone hotword usage can
+install `pip install -e '.[rag-native]'` and select
+`PhonemeCorrector(refiner="numba")`. Measurement uses Numba 0.65.0 and NumPy
+1.26.4 in the existing Python 3.10 inference environment.
+
+Kernel compilation/cache loading and vocabulary encoding happen while loading
+the vocabulary, before inference. A cold process therefore pays startup cost;
+the warmed request timings exclude that cost. Tests verify that normal requests
+use the preloaded native signature without compiling another specialization.
+Numba caches the compiled code on disk. Substitution costs remain query-local,
+so vocabulary changes do not reuse stale query scores. Vocabulary/refiner
+snapshots are replaced together. Shared cost tables and expanded per-alias
+matrices each have a 16 MiB bound; oversized work falls back to the Python
+matcher before allocating the native matrix.
+
+Validation passed 61 general CPU checks, thirteen native/phoneme/compatibility
+checks in the inference environment, and six real-GPU integration checks with
+default compilation/CUDA Graphs. Native/Python comparisons additionally match
+on 20,000 generated weighted-matching cases (seed 429) and 134 distinct full
+correction queries. Coverage includes empty sequences, cropped windows, mixed
+languages, English LCS, tones, aliases, blacklists, stable ties, vocabulary
+updates, missing dependencies and both matrix-budget fallback paths.
+
+A separate interleaved CPU comparison over those 134 distinct queries measured
+median refinement at 12.3 ms with Python versus 2.3 ms with Numba. Median total
+serial-coarse retrieval was 34.0 versus 24.4 ms. These are text-query timings;
+the audio benchmark below uses four native coarse-scoring workers.
+
+For the audio benchmark, the same resident 0.6B step-4695 engine alternates
+Python and Numba correctors in shuffled rounds (seed 42), with three warmup
+batches per case and twenty timed rounds. Both paths use four coarse-scoring
+workers, preparation microbatch 4, the same eight AISHELL dev files and
+12,286-term vocabulary, compiled vLLM 0.22.1, disabled prefix caching, model
+length 1024, a 96-token generation cap and GPU memory utilization 0.12 on
+physical GPU 3 (A800). Startup and audio reading are excluded.
+
+| Batch | Python refinement P50 | Native refinement P50 | Python full pipeline P50 | Native full pipeline P50 | Full pipeline reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 23.3 ms | 3.8 ms | 86.0 ms | 65.9 ms | 23.4% |
+| 4 | 80.7 ms | 12.3 ms | 195.5 ms | 126.8 ms | 35.1% |
+| 8 | 160.9 ms | 24.9 ms | 334.9 ms | 198.8 ms | 40.6% |
+
+These are whole-batch medians. Retrieval-call durations are summed within each
+request before computing phase medians. The single-input refinement reduction
+is approximately 84%; total retrieval is 39.9 → 20.2 ms. Coarse scoring and
+alignment are approximately 9.3 and 5.5 ms respectively in both paths. Native
+refinement includes substitution-table preparation, native DP and the remaining
+Python boundary/blacklist/ranking work. All timed cases retain identical rough
+transcripts, hotword lists and final transcriptions, and finish with an empty
+request feature cache.
+
+Full-pipeline P95 was 91.5 → 68.9 ms, 198.7 → 131.9 ms and 354.5 → 230.9 ms
+for batches 1 / 4 / 8. Twenty observations on a shared machine provide only
+preliminary tail estimates. This comparison is not a corpus accuracy evaluation
+or a concurrent-serving guarantee. An earlier run before the expanded-alias
+memory guard produced similar P50 improvements (87.2 → 67.9 ms for one input).
+
+Reports and the resident-engine comparison script are saved locally in
+`artifacts/context-optimization/round4/` (excluded from Git). To compare ordinary
+benchmark runs, pass `--rag-workers 4 --rag-refiner python` or
+`--rag-workers 4 --rag-refiner numba` to `scripts/benchmark_vllm.py`.
+
+Numba's [compilation, GIL and disk-cache behavior](https://numba.readthedocs.io/en/stable/user/jit.html)
+is documented separately from the measured results above.
+
+## Hotword prompt limit: 10 versus 100
+
+The limit comparison uses the optimized Numba refiner and four native coarse
+workers, the same 0.6B checkpoint, 12,286-term vocabulary and eight AISHELL dev
+inputs, on physical GPU 3. One resident engine alternates limits 10 and 100 in
+shuffled rounds (seed 42), with three warmup batches per configuration and
+twenty timed rounds. Preparation microbatch is 4, maximum model length is 1024,
+generation cap is 96 tokens and GPU memory utilization is 0.12. Compilation and
+CUDA Graphs are enabled; prefix caching is disabled. Startup and audio reading
+are excluded. Every input actually receives 10 or 100 hotwords respectively.
+
+| Batch | 10 hotwords P50 | 100 hotwords P50 | Extra time | Increase |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 64.0 ms | 65.5 ms | +1.6 ms | +2.4% |
+| 4 | 125.3 ms | 127.0 ms | +1.7 ms | +1.3% |
+| 8 | 195.6 ms | 207.3 ms | +11.8 ms | +6.0% |
+
+These are whole-batch warmed medians. Full-pipeline P95 is 65.5 → 69.2 ms,
+127.8 → 131.3 ms and 206.0 → 212.9 ms for batches 1 / 4 / 8; twenty observations
+give only preliminary tail estimates.
+
+Retrieval P50 remains approximately 19 ms for one input, 51 ms for four and
+101 ms for eight. Both limits already score/refine the same candidates; the
+limit truncates the final hotword selection. Most additional time is in the
+generation call: 28.5 → 29.6 ms for one input and 72.6 → 83.7 ms for eight.
+That call includes prompt processing and autoregressive generation. For the
+first input, prompt token count grows from 103 to 389, while output token count
+stays at 6. The eight inputs' final transcriptions match between limits, and
+the context feature cache is empty at completion. This is a latency comparison
+on eight inputs, not a recognition-quality evaluation of the larger prompt.
+
+Use `--max-ctx-hotwords 100` to reproduce the higher limit. Raw reports and the
+interleaved benchmark script are saved locally under
+`artifacts/context-optimization/hotword100/` (excluded from Git).
+
+## End-to-end comparison: eight inputs and 100 hotwords
+
+This comparison fixes the trained 0.6B step-4695 weights, the same eight AISHELL
+dev inputs (40.494 seconds total), the 12,286-term vocabulary and exactly 100
+selected hotwords per input for both CTC+RAG implementations. The original
+implementation uses the saved adapter from before batched preparation/device
+transport, plus the saved hotword code from before phoneme lookup, native
+coarse scoring and native refinement. Its encoder/CTC/RAG preparation is serial
+per utterance with CPU embedding transport. Final decoding is batched in both.
+
+The original and final engines run sequentially on the same physical GPU 3
+(A800). Both use compiled vLLM 0.22.1, disabled prefix caching, maximum model
+length 1024, a 96-token generation cap, GPU memory utilization 0.12, three warmup
+batches and twenty timed batches. The final engine also interleaves ASR-only
+controls and full CTC+RAG in shuffled rounds (seed 42). Weights stay resident;
+audio is read before timing. All latency numbers refer to returning the entire
+batch of eight.
+
+| Pipeline | Batch P50 | Batch P95 | Throughput from batch P50 |
+| --- | ---: | ---: | ---: |
+| Same-weight ASR, no hotword prompt | 100.1 ms | 104.5 ms | 79.9 utterances/s |
+| Same-weight ASR, pre-given matching 100 hotwords | 107.4 ms | 109.4 ms | 74.5 utterances/s |
+| Original unoptimized CTC+RAG, 100 hotwords | 872.9 ms | 887.4 ms | 9.2 utterances/s |
+| Final CTC+RAG, 100 hotwords | 196.1 ms | 199.7 ms | 40.8 utterances/s |
+
+Final CTC+RAG reduces batch P50 by 77.5% versus the original CTC+RAG path
+(4.45x throughput from the P50 ratio). It still adds 88.7 ms / 82.6% versus
+ASR supplied with the same 100-word prompts. That ASR control receives each
+utterance's context list precomputed by the final retriever; selection happens
+outside its timing. Full CTC+RAG includes selection on every timed call. Its
+retrieval-call durations sum to approximately 100.0 ms per batch, with some
+overlap with preparation; final generation takes approximately 75.2 ms versus
+74.8 ms for the pre-given-context ASR control.
+
+The ASR controls use the same trained checkpoint with CTC/retrieval computation
+skipped; unused CTC weights remain resident. This isolates pipeline overhead
+and does not compare official untuned weights with the trained model.
+Original and final CTC+RAG return identical rough transcripts, all 100 selected
+words in order, and final transcripts. All four paths' final transcripts match
+on these eight inputs, with one character error out of 121 normalized reference
+characters (CER 0.83%). This small sample is not evidence of hotword accuracy
+improvement or a serving-latency guarantee; twenty observations give only
+preliminary tail estimates.
+
+Raw reports, the current-engine comparison script, and the original source
+snapshots are saved locally under
+`artifacts/context-optimization/endtoend100/` (excluded from Git).
 
 ## vLLM 0.26: scope and difficulty
 

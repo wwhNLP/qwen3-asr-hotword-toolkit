@@ -9,6 +9,8 @@ from threading import Lock
 import numpy as np
 
 from . import ARCHITECTURE, register
+from .requests import (RequestPhonemeCache, RequestVocabularyCache, hotword_target,
+                       normalize_options, validate_mode_options)
 from utils.asr_metrics import transcript_text
 
 
@@ -52,6 +54,9 @@ class VLLMContextASR:
         max_audio_seconds=30,
         prepare_batch_size=4,
         embedding_transport="device",
+        rag_workers=4,
+        rag_refiner="auto",
+        request_cache_size=8,
         **engine_kwargs,
     ):
         if mode not in {"asr", "ctc", "ctc_rag"}:
@@ -62,6 +67,11 @@ class VLLMContextASR:
             raise ValueError("prepare_batch_size must be a positive integer.")
         if embedding_transport not in {"device", "cpu"}:
             raise ValueError("embedding_transport must be device or cpu.")
+        if type(rag_workers) is not int or rag_workers < 1:
+            raise ValueError("rag_workers must be a positive integer.")
+        if rag_refiner not in {"auto", "python", "numba"}:
+            raise ValueError("rag_refiner must be auto, python or numba.")
+        request_cache = RequestVocabularyCache(max_entries=request_cache_size)
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
         if version("vllm").split("+")[0] != "0.22.1":
@@ -85,10 +95,16 @@ class VLLMContextASR:
         self._corrector = None
         if mode == "ctc_rag":
             from hotword import PhonemeCorrector
-            self._corrector = PhonemeCorrector(threshold=rag_threshold)
+            self._corrector = PhonemeCorrector(threshold=rag_threshold, refiner=rag_refiner)
             self._corrector.update_hotwords(hotword_text)
         self.prepare_batch_size = prepare_batch_size
         self.embedding_transport = embedding_transport
+        self.rag_workers = rag_workers
+        self.rag_refiner = rag_refiner
+        self.rag_threshold = rag_threshold
+        self._request_cache = request_cache
+        self._request_phonemes = RequestPhonemeCache(max_entries=8192 if request_cache_size else 0)
+        self._last_rag_refiners = set()
         self.max_ctx_hotwords = max_ctx_hotwords
 
         register()
@@ -122,21 +138,31 @@ class VLLMContextASR:
             )
         )
 
-    def transcribe(self, audio, *, hotwords=None):
-        return self.transcribe_batch([audio], hotwords=hotwords)[0]
+    def transcribe(self, audio, *, hotwords=None, max_ctx_hotwords=None, max_new_tokens=None):
+        options = {"max_ctx_hotwords": max_ctx_hotwords, "max_new_tokens": max_new_tokens}
+        return self.transcribe_batch([audio], hotwords=hotwords, request_options=[options])[0]
 
-    def transcribe_batch(self, audios, *, hotwords=None):
+    def transcribe_batch(self, audios, *, hotwords=None, request_options=None):
+        """Transcribe a batch with optional shared and per-audio hotword options."""
         waveforms = [read_audio(audio) if isinstance(audio, (str, Path)) else np.asarray(audio, dtype=np.float32) for audio in audios]
+        options = normalize_options(len(waveforms), hotwords, request_options)
+        validate_mode_options(self.mode, options)
         for waveform in waveforms:
             if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
                 raise ValueError("Audio must be a nonempty, finite, mono waveform at 16 kHz.")
             if len(waveform) > self.max_audio_samples:
                 raise ValueError("Audio exceeds max_audio_seconds; split it into shorter segments first.")
         if not waveforms:
+            with self._lock:
+                self._last_rag_refiners.clear()
             return []
         with self._lock:
             prepared = []
             cached_ids = []
+            self._last_rag_refiners = set()
+            # Reuse within this batch even when cross-call caching is disabled,
+            # without retaining an unbounded number of request vocabularies.
+            request_correctors = RequestVocabularyCache()
             try:
                 # Only the main thread touches vLLM. While the worker encodes
                 # chunk N+1, this CPU thread retrieves hotwords for chunk N.
@@ -155,15 +181,19 @@ class VLLMContextASR:
                         if len(items) != len(chunk):
                             raise RuntimeError("Worker returned an unexpected number of audio contexts.")
                         if pool is None:
-                            prepared.extend(self._finish_context_batch(items, list(hotwords or [])))
+                            prepared.extend(self._finish_context_batch(
+                                items, options[offset:offset + len(chunk)], request_correctors
+                            ))
                         else:
-                            pending.append(pool.submit(self._finish_context_batch, items, list(hotwords or [])))
+                            pending.append(pool.submit(self._finish_context_batch, items,
+                                                       options[offset:offset + len(chunk)], request_correctors))
                     for future in pending:
                         prepared.extend(future.result())
                 results = []
                 if self.mode != "ctc":
                     requests = [self._generation_request(item) for item in prepared]
-                    results = self.llm.generate(requests, self.sampling_params, use_tqdm=False)
+                    sampling = self._sampling_for_requests(options)
+                    results = self.llm.generate(requests, sampling, use_tqdm=False)
                     if len(results) != len(prepared):
                         raise RuntimeError("Decoder returned an unexpected number of transcriptions.")
                 outputs = []
@@ -179,14 +209,45 @@ class VLLMContextASR:
                 if cached_ids:
                     self.llm.collective_rpc("context_release", args=(cached_ids,))
 
-    def _finish_context_batch(self, items, manual_hotwords):
-        for item in items:
-            hotwords = manual_hotwords
+    def _create_request_corrector(self, hotwords):
+        from hotword import PhonemeCorrector
+
+        corrector = PhonemeCorrector(threshold=self.rag_threshold, refiner=self.rag_refiner)
+        corrector.update_hotword_entries(hotwords, phoneme_lookup=self._request_phonemes.get)
+        return corrector
+
+    def _finish_context_batch(self, items, options, request_correctors):
+        selected = [[] for _ in items]
+        if self.mode == "ctc_rag":
+            groups = {}
+            for index, option in enumerate(options):
+                limit = self.max_ctx_hotwords if option.max_ctx_hotwords is None else option.max_ctx_hotwords
+                if limit and option.hotwords != ():
+                    groups.setdefault(option.hotwords, []).append((index, limit))
+            for words, members in groups.items():
+                if words is None:
+                    corrector = self._corrector
+                else:
+                    corrector = request_correctors.get(
+                        words, lambda vocab: self._request_cache.get(vocab, self._create_request_corrector)
+                    )
+                retrieval = corrector.correct_batch(
+                    [items[index]["rough"] for index, _ in members],
+                    k=max(limit for _, limit in members), workers=self.rag_workers,
+                )
+                self._last_rag_refiners.add(corrector.refiner_backend)
+                if len(retrieval) != len(members):
+                    raise RuntimeError("Retriever returned an unexpected number of results.")
+                for (index, limit), result in zip(members, retrieval):
+                    selected[index] = select_hotwords(result, limit)
+        for index, item in enumerate(items):
             if self.mode == "ctc_rag":
-                hotwords = []
-                if self.max_ctx_hotwords:
-                    result = self._corrector.correct(item["rough"], k=self.max_ctx_hotwords)
-                    hotwords = select_hotwords(result, self.max_ctx_hotwords)
+                hotwords = selected[index]
+            else:
+                hotwords = [target for entry in options[index].hotwords or ()
+                            if (target := hotword_target(entry)) is not None]
+                if options[index].max_ctx_hotwords is not None:
+                    hotwords = hotwords[:options[index].max_ctx_hotwords]
             item["hotwords"] = hotwords
             if self.mode != "ctc":
                 system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""
@@ -195,6 +256,36 @@ class VLLMContextASR:
                     {"role": "user", "content": [{"type": "audio", "audio": ""}]},
                 ], add_generation_prompt=True, tokenize=False)
         return items
+
+    def _sampling_for_requests(self, options):
+        if all(option.max_new_tokens is None for option in options):
+            return self.sampling_params
+        # Per-request clones prevent one limit from changing another request.
+        sampling = []
+        for option in options:
+            if option.max_new_tokens is None:
+                sampling.append(self.sampling_params)
+            else:
+                params = self.sampling_params.clone()
+                params.max_tokens = option.max_new_tokens
+                sampling.append(params)
+        return sampling
+
+    def request_cache_info(self):
+        """Return counts and cached vocabulary text bytes, excluding object overhead."""
+        with self._lock:
+            return {**self._request_cache.info(), "phonemes": self._request_phonemes.info()}
+
+    def last_rag_refiner_backends(self):
+        """Return corrector backends used by the most recent batch."""
+        with self._lock:
+            return sorted(self._last_rag_refiners)
+
+    def clear_request_cache(self):
+        """Discard cached request vocabularies and their reusable phonemes."""
+        with self._lock:
+            self._request_cache.clear()
+            self._request_phonemes.clear()
 
     @staticmethod
     def _generation_request(item):

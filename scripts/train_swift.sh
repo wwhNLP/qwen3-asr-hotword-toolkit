@@ -5,7 +5,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/artifacts/aishell}"
 SFT_DIR="${PROJECT_DIR}/artifacts/sft-0.6b"
-STAGE=sft
+STAGE=ctc
 if (($#)) && [[ "$1" != -* ]]; then
   STAGE="${1:-sft}"
   shift

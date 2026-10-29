@@ -1,10 +1,7 @@
 # coding: utf-8
 """
-RapidFuzz 全局批量加速版 FastRAG (掩码剥离版)
-
-与 rag_fast.py 接口一致（FastRAG 类），利用 rapidfuzz.process.extract
-在 C++ 层一次性对所有热词进行滑动匹配，彻底干掉倒排索引、锚点扫描以及 Python 层的匹配循环。
-并在匹配成功的候选上使用掩码剥离机制支持多位置匹配召回。
+使用 RapidFuzz 全词表粗筛，并以对齐、掩码和 OSA 距离保留多位置匹配。
+search_batch 使用原生 CPU 线程并行粗筛，search 保留单条串行入口。
 """
 from typing import List, Dict, Tuple
 import time
@@ -15,6 +12,11 @@ from .rag_fast import PhonemeEncoder
 import rapidfuzz.fuzz as _fuzz
 import rapidfuzz.distance.OSA as _OSA
 import rapidfuzz.process as _process
+
+# Bound the float64 score matrix independently of caller batch/vocabulary size.
+_MAX_SCORE_MATRIX_BYTES = 16 * 1024 * 1024
+# Starting native workers costs more than a few dozen fuzzy comparisons.
+_MIN_PARALLEL_COMPARISONS = 128
 
 
 class FastRAG:
@@ -44,13 +46,12 @@ class FastRAG:
         if not input_phonemes or not self.hotwords:
             return []
 
-        t_start = time.perf_counter()
         phoneme_strs = [p.value for p in input_phonemes]
         input_list = self.encoder.encode_sequence(phoneme_strs)
         pr_cutoff = self.threshold * 100
 
         t_step1_start = time.perf_counter()
-        # 一次性调用 C++ 批量匹配，过滤 99.9% 绝不可能匹配的候选词
+        # 一次调用原生匹配，保留超过阈值的候选词。
         matches = _process.extract(
             input_list,
             self.hotwords,
@@ -62,6 +63,60 @@ class FastRAG:
         step1_ms = (t_step1_end - t_step1_start) * 1000
 
         t_step2_start = time.perf_counter()
+        results = self._align_matches(input_list, matches, top_k)
+        step2_ms = (time.perf_counter() - t_step2_start) * 1000
+        logger.debug(
+            f"FastRAG_batch.search - "
+            f"第一步(extract 粗筛) 耗时: {step1_ms:.2f}ms, 候选数: {len(matches)} | "
+            f"第二步(对齐+掩码) 耗时: {step2_ms:.2f}ms, 最终匹配数: {len(results)}"
+        )
+        return results
+
+    def search_batch(self, inputs: List[List[Phoneme]], top_k: int = 0,
+                     workers: int = 4) -> List[List[Tuple[str, float, int]]]:
+        """Batch coarse scoring in native CPU workers; preserve scalar ranking."""
+        if type(workers) is not int or workers < 1:
+            raise ValueError("workers must be a positive integer.")
+        comparisons = len(self.hotwords) * sum(bool(phonemes) for phonemes in inputs)
+        if (not inputs or workers == 1 or not self.hotwords
+                or comparisons < _MIN_PARALLEL_COMPARISONS):
+            return [self.search(phonemes, top_k) for phonemes in inputs]
+
+        import numpy as np
+
+        keys = list(self.hotwords)
+        choices = list(self.hotwords.values())
+        bytes_per_query = len(choices) * np.dtype(np.float64).itemsize
+        if bytes_per_query > _MAX_SCORE_MATRIX_BYTES:
+            return [self.search(phonemes, top_k) for phonemes in inputs]
+        queries_per_chunk = max(1, _MAX_SCORE_MATRIX_BYTES // bytes_per_query)
+        # Empty queries must retain the scalar path's empty result even when
+        # the score cutoff is zero or negative.
+        active = [(index, self.encoder.encode_sequence([p.value for p in phonemes]))
+                  for index, phonemes in enumerate(inputs) if phonemes]
+        results = [[] for _ in inputs]
+        cutoff = self.threshold * 100
+        for offset in range(0, len(active), queries_per_chunk):
+            chunk = active[offset:offset + queries_per_chunk]
+            # partial_ratio is symmetric. Put vocabulary entries on the native
+            # worker axis so even one utterance can use multiple CPU cores.
+            # Alignment below retains the original input/hotword orientation.
+            scores = _process.cdist(
+                choices, [codes for _, codes in chunk], scorer=_fuzz.partial_ratio,
+                score_cutoff=cutoff, dtype=np.float64, workers=min(workers, len(choices)),
+            )
+            for (index, codes), row in zip(chunk, scores.T):
+                positions = np.flatnonzero(row >= cutoff)
+                # extract() resolves ties by original dictionary insertion
+                # order. float64 and stable sorting preserve that contract.
+                positions = positions[np.argsort(-row[positions], kind="stable")]
+                matches = ((choices[i], float(row[i]), keys[i]) for i in positions)
+                results[index] = self._align_matches(codes, matches, top_k)
+        return results
+
+    def _align_matches(self, input_list, matches, top_k):
+        """Shared alignment/masking stage for scalar and batch coarse scoring."""
+        pr_cutoff = self.threshold * 100
         results = []
         for match_val, score, key in matches:
             hw, hw_tuple = key
@@ -107,16 +162,6 @@ class FastRAG:
 
         results = [(hw, score, end_pos) for (hw, _), (score, end_pos) in final.items()]
         results.sort(key=lambda x: x[1], reverse=True)
-        t_step2_end = time.perf_counter()
-        step2_ms = (t_step2_end - t_step2_start) * 1000
-        
-        # 输出每次检索各阶段的时间细节，便于协调分析
-        logger.debug(
-            f"FastRAG_batch.search - "
-            f"第一步(extract 粗筛) 耗时: {step1_ms:.2f}ms, 候选数: {len(matches)} | "
-            f"第二步(对齐+掩码) 耗时: {step2_ms:.2f}ms, 最终匹配数: {len(results)}"
-        )
-
         return results if top_k <= 0 else results[:top_k]
 
 

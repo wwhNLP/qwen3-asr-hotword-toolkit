@@ -1,9 +1,10 @@
 """Regression tests for retrieval limits and contextual blacklists."""
 
 import importlib.util
+import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 HAS_PINYIN = importlib.util.find_spec("pypinyin") is not None
@@ -12,6 +13,114 @@ HAS_VLLM = importlib.util.find_spec("vllm") is not None
 
 @unittest.skipUnless(HAS_PINYIN, "pypinyin is required for hotword retrieval")
 class HotwordRetrievalTest(unittest.TestCase):
+    def test_entry_phonemes_are_reused_across_different_vocabularies(self):
+        from hotword import PhonemeCorrector
+        from qwen3_asr_vllm.requests import RequestPhonemeCache
+
+        cache = RequestPhonemeCache()
+        cached = PhonemeCorrector(refiner="python")
+        reference = PhonemeCorrector(refiner="python")
+        cached.update_hotword_entries(["广州|广洲", "康辉"], phoneme_lookup=cache.get)
+        cached.update_hotword_entries(["广州|广洲", "上海"], phoneme_lookup=cache.get)
+        reference.update_hotword_entries(["广州|广洲", "上海"])
+        self.assertEqual(cached.correct("广洲和上海"), reference.correct("广洲和上海"))
+        self.assertEqual(cache.info()["hits"], 2)
+        self.assertEqual(cache.info()["misses"], 4)
+        cache.clear()
+        self.assertEqual(cache.info()["entries"], 0)
+        tiny = RequestPhonemeCache(max_entries=2, max_entry_bytes=1)
+        self.assertEqual(tiny.get("广州"), tiny.get("广州"))
+        self.assertEqual(tiny.info()["bypassed"], 2)
+        self.assertEqual(tiny.info()["entries"], 0)
+
+    def test_explicit_entries_preserve_hash_words_and_file_comments(self):
+        from hotword import PhonemeCorrector
+
+        corrector = PhonemeCorrector(refiner="python")
+        corrector.update_hotword_entries(["#AI", "广州|广洲"])
+        self.assertEqual(set(corrector.hotwords), {"#AI", "广州"})
+        self.assertIn("广州", {item[1] for item in corrector.correct("广洲").similars})
+        corrector.update_hotwords("# comment\n广州")
+        self.assertEqual(set(corrector.hotwords), {"广州"})
+
+    def test_batch_correction_matches_scalar_with_aliases_blacklists_and_updates(self):
+        from hotword import PhonemeCorrector
+
+        corrector = PhonemeCorrector()
+        texts = ["", "!!!", "央视主持人康灰", "朋友叫康灰，后来又遇到了康灰",
+                 "广洲和广州", "周滔去了广洲", "CapsWriter 和 Python 3", "完全无关的一句话"]
+        for vocabulary in ("康辉|康灰~~~央视\n广州|广洲\n周涛|周滔\nCapsWriter|Caps Writer\nPython",
+                           "上海|上嗨\n深圳\n康辉~~~朋友", ""):
+            corrector.update_hotwords(vocabulary)
+            for k in (0, 1, 10):
+                expected = [corrector.correct(text, k=k) for text in texts]
+                for workers in (1, 2, 4):
+                    with self.subTest(vocabulary=vocabulary, k=k, workers=workers):
+                        self.assertEqual(corrector.correct_batch(texts, k=k, workers=workers), expected)
+                        self.assertEqual(corrector.correct_batch([texts[2]], k=k, workers=workers), [expected[2]])
+        self.assertEqual(corrector.correct_batch([]), [])
+        for workers in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                corrector.correct_batch(texts, workers=workers)
+
+    def test_native_batch_search_preserves_thresholds_ties_and_occurrences(self):
+        from hotword.algo_phoneme import Phoneme
+        from hotword.rag_fast_batch import FastRAG
+
+        def phones(values):
+            return [Phoneme(value, "zh") for value in values]
+
+        rng = random.Random(42)
+        alphabet = list("abcdefgh")
+        vocabulary = {f"term{index}": [phones(rng.choices(alphabet, k=rng.randint(1, 8)))]
+                      for index in range(30)}
+        vocabulary.update({"tie_first": [phones("abc")], "tie_second": [phones("abc")],
+                           "alias": [phones("abc"), phones("bcd")]})
+        inputs = [phones(values) for values in ("", "abc", "abcxxxxabc", "zzzz", "bcd", "abcdefgh" * 10)]
+        inputs += [phones(rng.choices(alphabet, k=rng.randint(1, 25))) for _ in range(12)]
+        for threshold in (0, 0.2, 0.55, 0.85, 1.0):
+            rag = FastRAG(threshold=threshold)
+            rag.add_hotwords(vocabulary)
+            for top_k in (0, 1, 5):
+                expected = [rag.search(query, top_k=top_k) for query in inputs]
+                for workers in (1, 2, 4):
+                    with self.subTest(threshold=threshold, top_k=top_k, workers=workers):
+                        self.assertEqual(rag.search_batch(inputs, top_k=top_k, workers=workers), expected)
+
+    def test_native_score_matrix_respects_memory_budget(self):
+        from hotword import rag_fast_batch as module
+        from hotword.algo_phoneme import get_phoneme_info
+
+        rag = module.FastRAG()
+        rag.add_hotwords({word: [get_phoneme_info(word)] for word in ("广州", "上海", "深圳")})
+        inputs = [get_phoneme_info(text) for text in ("广洲", "上嗨", "深圳", "广州", "上海")]
+        expected = [rag.search(query) for query in inputs]
+        row_bytes = len(rag.hotwords) * 8
+        native = module._process.cdist
+        with patch.object(module, "_MIN_PARALLEL_COMPARISONS", 0), \
+             patch.object(module, "_MAX_SCORE_MATRIX_BYTES", row_bytes * 2), \
+             patch.object(module._process, "cdist", wraps=native) as cdist:
+            self.assertEqual(rag.search_batch(inputs), expected)
+            self.assertTrue(all(len(call.args[1]) <= 2 for call in cdist.call_args_list))
+            self.assertEqual(cdist.call_count, 3)
+        with patch.object(module, "_MIN_PARALLEL_COMPARISONS", 0), \
+             patch.object(module, "_MAX_SCORE_MATRIX_BYTES", row_bytes - 1), \
+             patch.object(module._process, "cdist") as cdist:
+            self.assertEqual(rag.search_batch(inputs), expected)
+            cdist.assert_not_called()
+
+    def test_small_vocabulary_avoids_native_worker_startup(self):
+        from hotword import rag_fast_batch as module
+        from hotword.algo_phoneme import get_phoneme_info
+
+        rag = module.FastRAG()
+        rag.add_hotwords({"广州": [get_phoneme_info("广州")]})
+        inputs = [get_phoneme_info("广洲")]
+        expected = [rag.search(query) for query in inputs]
+        with patch.object(module._process, "cdist") as cdist:
+            self.assertEqual(rag.search_batch(inputs, workers=4), expected)
+            cdist.assert_not_called()
+
     def test_similar_phoneme_lookup_preserves_group_membership(self):
         from hotword.algo_calc import SIMILAR_PHONEMES, _is_similar_phoneme
 

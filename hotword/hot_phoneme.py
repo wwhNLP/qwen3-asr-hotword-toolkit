@@ -41,16 +41,22 @@ class PhonemeCorrector:
     拼音纠错器
 
     使用两阶段检索策略：
-    1. FastRAG 粗筛：使用倒排索引快速过滤候选
+    1. FastRAG 粗筛：使用 RapidFuzz 全词表匹配过滤候选
     2. 精筛：使用模糊音权重编辑距离进行精确匹配
 
     并将相似度超过阈值的片段替换为热词。
     """
 
-    def __init__(self, threshold: float = 0.85, similar_threshold: float = None):
+    def __init__(self, threshold: float = 0.85, similar_threshold: float = None,
+                 refiner: str = "auto"):
         """
         初始化拼音纠错器
         """
+        if refiner not in {"auto", "python", "numba"}:
+            raise ValueError("refiner must be auto, python or numba.")
+        self.refiner = refiner
+        self.refiner_backend = "python"
+        self._native_refiner = None
         self.threshold = threshold
         self.similar_threshold = similar_threshold if similar_threshold is not None else threshold - 0.2
 
@@ -61,10 +67,18 @@ class PhonemeCorrector:
 
     def update_hotwords(self, hotword_text: str) -> int:
         """更新纠错热词库 (线程安全)"""
+        return self._update_hotword_lines(hotword_text.splitlines(), skip_comments=True, phoneme_lookup=None)
+
+    def update_hotword_entries(self, entries: List[str], *, phoneme_lookup=None) -> int:
+        """Update from explicit entries, including words beginning with '#'."""
+        return self._update_hotword_lines(entries, skip_comments=False, phoneme_lookup=phoneme_lookup)
+
+    def _update_hotword_lines(self, values, *, skip_comments, phoneme_lookup):
         start_time = time.time()
         
         # 预析取有效行
-        lines = [line.strip() for line in hotword_text.splitlines() if line.strip() and not line.strip().startswith('#')]
+        lines = [line.strip() for line in values
+                 if line.strip() and not (skip_comments and line.strip().startswith('#'))]
         
         new_hotwords: Dict[str, List[List[Phoneme]]] = {}
         new_blacklists: Dict[str, Set[str]] = {}
@@ -81,7 +95,7 @@ class PhonemeCorrector:
             
             phoneme_lists = []
             for part in parts:
-                phons = get_phoneme_info(part)
+                phons = list(phoneme_lookup(part)) if phoneme_lookup else get_phoneme_info(part)
                 if phons:
                     phoneme_lists.append(phons)
             
@@ -91,11 +105,22 @@ class PhonemeCorrector:
                 new_hotwords[target] = phoneme_lists
                 new_blacklists[target] = blacklist_words
         
+        native_refiner = None
+        if new_hotwords and self.refiner != "python":
+            try:
+                from .native_refine import NativeRefiner
+                native_refiner = NativeRefiner(new_hotwords)
+            except Exception as exc:
+                if self.refiner == "numba":
+                    raise RuntimeError("Numba refinement is unavailable; check the Numba installation and JIT settings.") from exc
+                logger.warning("Native refinement unavailable; using Python: %s", exc)
         with self._lock:
             self.hotwords = new_hotwords
             self.blacklists = new_blacklists
             self.fast_rag = FastRAG(threshold=min(self.threshold, self.similar_threshold) - 0.1)
             self.fast_rag.add_hotwords(new_hotwords)
+            self._native_refiner = native_refiner
+            self.refiner_backend = "numba" if native_refiner is not None else "python"
         
         logger.debug(f"PhonemeCorrector 已更新 {len(new_hotwords)} 个热词，耗时 {time.time() - start_time:.3f}s")
         return len(new_hotwords)
@@ -116,23 +141,26 @@ class PhonemeCorrector:
                 seen_targets[hw].append(approx_end_idx)
 
         search_threshold = min(self.threshold, self.similar_threshold) - 0.1
+        native = (self._native_refiner.prepare(input_processed, seen_targets)
+                  if self._native_refiner is not None else None)
 
         # 对每个目标遍历其所有出现位置
         for hw, approx_end_indices in seen_targets.items():
             for approx_end_idx in approx_end_indices:
-                for hw_phonemes in self.hotwords[hw]:
-                    hw_compare = [p.info[:5] for p in hw_phonemes]
+                for alias_index, hw_phonemes in enumerate(self.hotwords[hw]):
 
                     # [性能优化] 仅在 FastRAG 预测的结束位置附近进行搜索
                     # 窗口大小：热词长度 + 左右各 5 个音素的缓冲
-                    window_size = len(hw_compare) + 10
+                    window_size = len(hw_phonemes) + 10
                     window_start = max(0, approx_end_idx - window_size)
                     window_end = min(len(input_processed), approx_end_idx + 5)
 
-                    local_input = input_processed[window_start:window_end]
-
-                    # 搜索匹配
-                    found_segments = fuzzy_substring_search_constrained(hw_compare, local_input, threshold=search_threshold)
+                    found_segments = (native.search(hw, alias_index, window_start, window_end, search_threshold)
+                                      if native is not None else None)
+                    if found_segments is None:
+                        hw_compare = [p.info[:5] for p in hw_phonemes]
+                        local_input = input_processed[window_start:window_end]
+                        found_segments = fuzzy_substring_search_constrained(hw_compare, local_input, threshold=search_threshold)
 
                     for score, start_phon_idx, end_phon_idx in found_segments:
                         # 转换回全局索引
@@ -279,22 +307,35 @@ class PhonemeCorrector:
         with self._lock:
             # 粗筛
             fast_results = self.fast_rag.search(input_phonemes, top_k=0)
+            return self._correct_from_candidates(text, input_phonemes, fast_results, k, window)
 
-            # 预处理输入 (转换为全能七元组：值, 语言, 字始, 字终, 是调, 始位, 终位)
-            try:
-                input_processed = [p.info for p in input_phonemes]
-            except Exception as e:
-                logger.error(f"[ERROR] Failed to build input_processed: {e}")
-                logger.error(f"[ERROR] input_phonemes details: {[(type(p), p) for p in input_phonemes[:5]]}")
-                raise
+    def correct_batch(self, texts: List[str], k: int = 10, blacklist_window: int = 5,
+                      workers: int = 4) -> List[CorrectionResult]:
+        """Batch native scoring; workers=1 retains per-utterance serial calls."""
+        if type(workers) is not int or workers < 1:
+            raise ValueError("workers must be a positive integer.")
+        if not texts or workers == 1:
+            return [self.correct(text, k, blacklist_window) for text in texts]
+        with self._lock:
+            if not self.hotwords:
+                return [CorrectionResult(text, [], []) for text in texts]
+            phonemes = [get_phoneme_info(text) if text else [] for text in texts]
+            candidates = self.fast_rag.search_batch(phonemes, top_k=0, workers=workers)
+            return [self._correct_from_candidates(text, phones, matches, k, blacklist_window)
+                    if phones else CorrectionResult(text, [], [])
+                    for text, phones, matches in zip(texts, phonemes, candidates)]
 
-            # 精筛
-            matches, similars = self._find_matches(text, fast_results, input_processed, window)
+    def _correct_from_candidates(self, text, input_phonemes, fast_results, k, window):
+        """Caller holds _lock through matching and replacement."""
+        try:
+            input_processed = [p.info for p in input_phonemes]
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to build input_processed: {e}")
+            logger.error(f"[ERROR] input_phonemes details: {[(type(p), p) for p in input_phonemes[:5]]}")
+            raise
 
-            # Keep the same hotword/blacklist snapshot for matching and replacement.
-            new_text, final_hw_info, _ = self._resolve_and_replace(text, matches, window)
-        
-        # similars 已经是 [(origin, hw, score), ...] 的元组列表
+        matches, similars = self._find_matches(text, fast_results, input_processed, window)
+        new_text, final_hw_info, _ = self._resolve_and_replace(text, matches, window)
         return CorrectionResult(text=new_text, matches=final_hw_info, similars=similars[:k])
 
 

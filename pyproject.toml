@@ -9,6 +9,7 @@ description = "Qwen3-ASR CTC and phoneme RAG inference with a vLLM worker backen
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
+rag-native = ["numba>=0.61", "pypinyin>=0.55", "rapidfuzz>=3"]
 vllm = [
     "vllm[audio]==0.22.1",
     "transformers==4.57.6",
@@ -16,6 +17,7 @@ vllm = [
     "quack-kernels==0.3.3",
     "pypinyin>=0.55",
     "rapidfuzz>=3",
+    "numba>=0.61",
     "soundfile>=0.12",
     "scipy>=1.10",
 ]
