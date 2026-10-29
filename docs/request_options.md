@@ -89,6 +89,11 @@ included in a cache miss and the initial warmups; repeated cached measurements
 exclude the first construction. Prefix caching stays disabled. Output and
 input paths cannot refer to the same file.
 
+Benchmark reports record the configured `rag_refiner` and, for each run, the
+`rag_refiner_backends` of the correctors actually used for retrieval. An empty
+list means retrieval did not run. A Numba corrector can still fall back to Python
+for an individual query when the refinement memory limit is exceeded.
+
 ## Local latency measurements
 
 Measured on a shared NVIDIA A800 GPU with the trained 0.6B step-4695 checkpoint,

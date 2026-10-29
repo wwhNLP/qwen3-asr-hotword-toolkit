@@ -82,7 +82,7 @@ def main():
               "prepare_batch_size": getattr(engine, "prepare_batch_size", None),
               "embedding_transport": getattr(engine, "embedding_transport", None),
               "rag_workers": getattr(engine, "rag_workers", None),
-              "rag_refiner": getattr(getattr(engine, "_corrector", None), "refiner_backend", None),
+              "rag_refiner": engine.rag_refiner,
               "max_model_len": args.max_model_len,
               "max_new_tokens": args.max_new_tokens,
               "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -98,25 +98,31 @@ def main():
     rng = random.Random(42)
     for size in args.batch_sizes:
         batch = [waveforms[index % len(waveforms)] for index in range(size)]
-        measured = {name: {"seconds": []} for name, _, _ in cases}
+        measured = {name: {"seconds": [], "refiner_backends": set()} for name, _, _ in cases}
         for _, mode, limit in cases:
             engine.mode, engine.max_ctx_hotwords = mode, limit
+            options = ([{"max_ctx_hotwords": limit} for _ in batch]
+                       if mode == "asr" and request_words is not None else None)
             for _ in range(args.warmup):
-                engine.transcribe_batch(batch, hotwords=request_words)
+                engine.transcribe_batch(batch, hotwords=request_words, request_options=options)
         for _ in range(args.repeats):
             order = list(cases)
             rng.shuffle(order)
             for name, mode, limit in order:
                 engine.mode, engine.max_ctx_hotwords = mode, limit
+                options = ([{"max_ctx_hotwords": limit} for _ in batch]
+                           if mode == "asr" and request_words is not None else None)
                 start = time.perf_counter()
-                results = engine.transcribe_batch(batch, hotwords=request_words)
+                results = engine.transcribe_batch(batch, hotwords=request_words, request_options=options)
                 measured[name]["seconds"].append(time.perf_counter() - start)
+                measured[name]["refiner_backends"].update(engine.last_rag_refiner_backends())
                 measured[name]["results"] = results
         audio_seconds = sum(len(wave) for wave in batch) / 16000
         for name, mode, limit in cases:
             timings = measured[name]["seconds"]
             report["runs"].append({
                 "case": name, "mode": mode, "max_ctx_hotwords": limit,
+                "rag_refiner_backends": sorted(measured[name]["refiner_backends"]),
                 "batch": size, "batch_audio_seconds": audio_seconds,
                 "seconds": timings, "p50_ms": float(np.percentile(timings, 50) * 1000),
                 "p95_ms": float(np.percentile(timings, 95) * 1000),

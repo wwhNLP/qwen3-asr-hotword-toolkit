@@ -104,6 +104,7 @@ class VLLMContextASR:
         self.rag_threshold = rag_threshold
         self._request_cache = request_cache
         self._request_phonemes = RequestPhonemeCache(max_entries=8192 if request_cache_size else 0)
+        self._last_rag_refiners = set()
         self.max_ctx_hotwords = max_ctx_hotwords
 
         register()
@@ -152,10 +153,13 @@ class VLLMContextASR:
             if len(waveform) > self.max_audio_samples:
                 raise ValueError("Audio exceeds max_audio_seconds; split it into shorter segments first.")
         if not waveforms:
+            with self._lock:
+                self._last_rag_refiners.clear()
             return []
         with self._lock:
             prepared = []
             cached_ids = []
+            self._last_rag_refiners = set()
             # Reuse within this batch even when cross-call caching is disabled,
             # without retaining an unbounded number of request vocabularies.
             request_correctors = RequestVocabularyCache()
@@ -231,6 +235,7 @@ class VLLMContextASR:
                     [items[index]["rough"] for index, _ in members],
                     k=max(limit for _, limit in members), workers=self.rag_workers,
                 )
+                self._last_rag_refiners.add(corrector.refiner_backend)
                 if len(retrieval) != len(members):
                     raise RuntimeError("Retriever returned an unexpected number of results.")
                 for (index, limit), result in zip(members, retrieval):
@@ -270,6 +275,11 @@ class VLLMContextASR:
         """Return counts and cached vocabulary text bytes, excluding object overhead."""
         with self._lock:
             return {**self._request_cache.info(), "phonemes": self._request_phonemes.info()}
+
+    def last_rag_refiner_backends(self):
+        """Return corrector backends used by the most recent batch."""
+        with self._lock:
+            return sorted(self._last_rag_refiners)
 
     def clear_request_cache(self):
         """Discard cached request vocabularies and their reusable phonemes."""

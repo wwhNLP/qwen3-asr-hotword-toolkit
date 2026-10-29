@@ -31,11 +31,12 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime.rag_workers = 4
         runtime._request_cache = RequestVocabularyCache()
         runtime._request_phonemes = RequestPhonemeCache(max_entries=0)
+        runtime._last_rag_refiners = set()
         runtime.max_ctx_hotwords = 8
         runtime.sampling_params = object()
         runtime._lock = Lock()
         runtime._processor = SimpleNamespace(apply_chat_template=Mock(side_effect=lambda messages, **kw: str(messages)))
-        runtime._corrector = SimpleNamespace(correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
+        runtime._corrector = SimpleNamespace(refiner_backend="python", correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
         runtime._corrector.correct_batch = Mock(side_effect=lambda texts, k, workers: [
             runtime._corrector.correct(text, k=k) for text in texts
         ])
@@ -194,7 +195,7 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime, _, _ = self.make_runtime("ctc_rag")
 
         def make_corrector(words):
-            return SimpleNamespace(correct_batch=Mock(side_effect=lambda texts, k, workers: [
+            return SimpleNamespace(refiner_backend="numba", correct_batch=Mock(side_effect=lambda texts, k, workers: [
                 SimpleNamespace(matches=[], similars=[("", word, 1) for word in words][:k])
                 for _ in texts
             ]))
@@ -209,6 +210,7 @@ class VLLMRuntimeTest(unittest.TestCase):
             {},
         ]
         outputs = runtime.transcribe_batch(waves, request_options=options)
+        self.assertEqual(runtime.last_rag_refiner_backends(), ["numba", "python"])
         self.assertEqual([item["hotwords"] for item in outputs],
                          [["甲"], ["甲", "乙"], ["丙"], [], ["热词"]])
         self.assertEqual(runtime._create_request_corrector.call_count, 2)
@@ -216,6 +218,7 @@ class VLLMRuntimeTest(unittest.TestCase):
         self.assertEqual(runtime._create_request_corrector.call_count, 2)
         self.assertEqual(runtime.request_cache_info()["hits"], 1)
         self.assertEqual(runtime.transcribe(np.zeros(1600))["hotwords"], ["热词"])
+        self.assertEqual(runtime.last_rag_refiner_backends(), ["python"])
 
         shared = runtime.transcribe_batch(
             [np.zeros(1600), np.zeros(1600)], hotwords=["共享"],
@@ -268,7 +271,7 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime, _, _ = self.make_runtime("ctc_rag")
         runtime.prepare_batch_size = 1
         runtime._request_cache = RequestVocabularyCache(max_entries=0)
-        corrector = SimpleNamespace(correct_batch=Mock(side_effect=lambda texts, k, workers: [
+        corrector = SimpleNamespace(refiner_backend="python", correct_batch=Mock(side_effect=lambda texts, k, workers: [
             SimpleNamespace(matches=[], similars=[("", "甲", 1)]) for _ in texts
         ]))
         runtime._create_request_corrector = Mock(return_value=corrector)
