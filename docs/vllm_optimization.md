@@ -367,6 +367,54 @@ Use `--max-ctx-hotwords 100` to reproduce the higher limit. Raw reports and the
 interleaved benchmark script are saved locally under
 `artifacts/context-optimization/hotword100/` (excluded from Git).
 
+## End-to-end comparison: eight inputs and 100 hotwords
+
+This comparison fixes the trained 0.6B step-4695 weights, the same eight AISHELL
+dev inputs (40.494 seconds total), the 12,286-term vocabulary and exactly 100
+selected hotwords per input for both CTC+RAG implementations. The original
+implementation uses the saved adapter from before batched preparation/device
+transport, plus the saved hotword code from before phoneme lookup, native
+coarse scoring and native refinement. Its encoder/CTC/RAG preparation is serial
+per utterance with CPU embedding transport. Final decoding is batched in both.
+
+The original and final engines run sequentially on the same physical GPU 3
+(A800). Both use compiled vLLM 0.22.1, disabled prefix caching, maximum model
+length 1024, a 96-token generation cap, GPU memory utilization 0.12, three warmup
+batches and twenty timed batches. The final engine also interleaves ASR-only
+controls and full CTC+RAG in shuffled rounds (seed 42). Weights stay resident;
+audio is read before timing. All latency numbers refer to returning the entire
+batch of eight.
+
+| Pipeline | Batch P50 | Batch P95 | Throughput from batch P50 |
+| --- | ---: | ---: | ---: |
+| Same-weight ASR, no hotword prompt | 100.1 ms | 104.5 ms | 79.9 utterances/s |
+| Same-weight ASR, pre-given matching 100 hotwords | 107.4 ms | 109.4 ms | 74.5 utterances/s |
+| Original unoptimized CTC+RAG, 100 hotwords | 872.9 ms | 887.4 ms | 9.2 utterances/s |
+| Final CTC+RAG, 100 hotwords | 196.1 ms | 199.7 ms | 40.8 utterances/s |
+
+Final CTC+RAG reduces batch P50 by 77.5% versus the original CTC+RAG path
+(4.45x throughput from the P50 ratio). It still adds 88.7 ms / 82.6% versus
+ASR supplied with the same 100-word prompts. That ASR control receives each
+utterance's context list precomputed by the final retriever; selection happens
+outside its timing. Full CTC+RAG includes selection on every timed call. Its
+retrieval-call durations sum to approximately 100.0 ms per batch, with some
+overlap with preparation; final generation takes approximately 75.2 ms versus
+74.8 ms for the pre-given-context ASR control.
+
+The ASR controls use the same trained checkpoint with CTC/retrieval computation
+skipped; unused CTC weights remain resident. This isolates pipeline overhead
+and does not compare official untuned weights with the trained model.
+Original and final CTC+RAG return identical rough transcripts, all 100 selected
+words in order, and final transcripts. All four paths' final transcripts match
+on these eight inputs, with one character error out of 121 normalized reference
+characters (CER 0.83%). This small sample is not evidence of hotword accuracy
+improvement or a serving-latency guarantee; twenty observations give only
+preliminary tail estimates.
+
+Raw reports, the current-engine comparison script, and the original source
+snapshots are saved locally under
+`artifacts/context-optimization/endtoend100/` (excluded from Git).
+
 ## vLLM 0.26: scope and difficulty
 
 Assessment date: 2026-10-29. Source comparison uses the official **v0.26.0** tag.
