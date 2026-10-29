@@ -34,11 +34,17 @@ SIMILAR_PHONEMES = [
     {'k', 'g'},
 ]
 
+# Expand each group independently: e.g. p~t and p~b do not imply t~b.
+# Build once instead of scanning all groups at every edit-distance cell.
+_SIMILAR_PHONEME_PEERS = {
+    value: frozenset(peer for group in SIMILAR_PHONEMES if value in group for peer in group)
+    for value in {peer for group in SIMILAR_PHONEMES for peer in group}
+}
+
 
 def _is_similar_phoneme(a: str, b: str) -> bool:
     """检查两个音素是否属于同一个相似音素集"""
-    pair = {a, b}
-    return any(pair.issubset(s) for s in SIMILAR_PHONEMES)
+    return b in _SIMILAR_PHONEME_PEERS.get(a, ())
 
 
 def lcs_length(s1: str, s2: str) -> int:
@@ -173,32 +179,31 @@ def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tu
     if n == 0 or m == 0:
         return []
 
-    dp = [[float('inf')] * (m + 1) for _ in range(n + 1)]
-    path = [[(0, 0)] * (m + 1) for _ in range(n + 1)]
+    # Only the preceding row and each cell's start index are needed. Retaining
+    # the full distance/path matrices adds allocations to every candidate.
+    previous = [float('inf')] * (m + 1)
+    previous_starts = [0] * (m + 1)
 
     # 预提取 input 信息，减少循环内解包开销
     input_vals = [t[0] for t in input_info]
     input_langs = [t[1] for t in input_info]
     input_starts = [t[2] for t in input_info]
     input_ends = [t[3] for t in input_info]
-    input_phones = [t[4] for t in input_info]
-
-    hw_vals = [t[0] for t in hw_info]
-    hw_langs = [t[1] for t in hw_info]
-    hw_phones = [t[4] for t in hw_info]
 
     # 初始化第一行：允许从任何词起始边界开始匹配
     for j in range(m + 1):
         if j == 0 or (j < m and input_starts[j]):
-            dp[0][j] = 0.0
-            path[0][j] = (0, j)
+            previous[j] = 0.0
+            previous_starts[j] = j
 
-    for i in range(1, n + 1):
-        h_v, h_l, h_p = hw_vals[i-1], hw_langs[i-1], hw_phones[i-1]
+    for hotword in hw_info:
+        h_v, h_l, h_p = hotword[0], hotword[1], hotword[4]
+        current = [float('inf')] * (m + 1)
+        current_starts = [0] * (m + 1)
         row_min = float('inf')
 
         for j in range(1, m + 1):
-            i_v, i_l, i_p = input_vals[j-1], input_langs[j-1], input_phones[j-1]
+            i_v, i_l = input_vals[j-1], input_langs[j-1]
             if h_l != i_l:
                 cost = 1.0
             elif h_v == i_v:
@@ -216,43 +221,46 @@ def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tu
             else:
                 cost = 1.0
 
-            dist_match = dp[i-1][j-1] + cost
-            dist_del = dp[i-1][j] + 1.0
-            dist_ins = dp[i][j-1] + 1.0
+            dist_match = previous[j-1] + cost
+            dist_del = previous[j] + 1.0
+            dist_ins = current[j-1] + 1.0
 
             if dist_match <= dist_del:
                 if dist_match <= dist_ins:
-                    dp[i][j] = dist_match
-                    path[i][j] = path[i-1][j-1]
+                    distance = dist_match
+                    start = previous_starts[j-1]
                 else:
-                    dp[i][j] = dist_ins
-                    path[i][j] = path[i][j-1]
+                    distance = dist_ins
+                    start = current_starts[j-1]
             else:
                 if dist_del <= dist_ins:
-                    dp[i][j] = dist_del
-                    path[i][j] = path[i-1][j]
+                    distance = dist_del
+                    start = previous_starts[j]
                 else:
-                    dp[i][j] = dist_ins
-                    path[i][j] = path[i][j-1]
+                    distance = dist_ins
+                    start = current_starts[j-1]
 
-            if dp[i][j] < row_min:
-                row_min = dp[i][j]
+            current[j] = distance
+            current_starts[j] = start
+            if distance < row_min:
+                row_min = distance
 
         if row_min > n * (1.0 - threshold) + 2:
-            break
+            return []
+        previous, previous_starts = current, current_starts
 
     results = []
     for j in range(1, m + 1):
-        if not input_info[j-1][3]:  # is_word_end
+        if not input_ends[j-1]:
             continue
 
-        dist = dp[n][j]
+        dist = previous[j]
         if dist >= n * 0.8:
             continue
 
         score = 1.0 - (dist / n)
         if score >= threshold:
-            start_idx = path[n][j][1]
+            start_idx = previous_starts[j]
             results.append((score, start_idx, j))
 
     results.sort(key=lambda x: x[0], reverse=True)
