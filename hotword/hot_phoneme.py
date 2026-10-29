@@ -47,10 +47,16 @@ class PhonemeCorrector:
     并将相似度超过阈值的片段替换为热词。
     """
 
-    def __init__(self, threshold: float = 0.85, similar_threshold: float = None):
+    def __init__(self, threshold: float = 0.85, similar_threshold: float = None,
+                 refiner: str = "auto"):
         """
         初始化拼音纠错器
         """
+        if refiner not in {"auto", "python", "numba"}:
+            raise ValueError("refiner must be auto, python or numba.")
+        self.refiner = refiner
+        self.refiner_backend = "python"
+        self._native_refiner = None
         self.threshold = threshold
         self.similar_threshold = similar_threshold if similar_threshold is not None else threshold - 0.2
 
@@ -91,11 +97,22 @@ class PhonemeCorrector:
                 new_hotwords[target] = phoneme_lists
                 new_blacklists[target] = blacklist_words
         
+        native_refiner = None
+        if new_hotwords and self.refiner != "python":
+            try:
+                from .native_refine import NativeRefiner
+                native_refiner = NativeRefiner(new_hotwords)
+            except ImportError as exc:
+                if self.refiner == "numba":
+                    raise RuntimeError("Numba refinement is unavailable; check the Numba installation and JIT settings.") from exc
+                logger.debug("Native refinement unavailable; using Python: %s", exc)
         with self._lock:
             self.hotwords = new_hotwords
             self.blacklists = new_blacklists
             self.fast_rag = FastRAG(threshold=min(self.threshold, self.similar_threshold) - 0.1)
             self.fast_rag.add_hotwords(new_hotwords)
+            self._native_refiner = native_refiner
+            self.refiner_backend = "numba" if native_refiner is not None else "python"
         
         logger.debug(f"PhonemeCorrector 已更新 {len(new_hotwords)} 个热词，耗时 {time.time() - start_time:.3f}s")
         return len(new_hotwords)
@@ -116,23 +133,26 @@ class PhonemeCorrector:
                 seen_targets[hw].append(approx_end_idx)
 
         search_threshold = min(self.threshold, self.similar_threshold) - 0.1
+        native = (self._native_refiner.prepare(input_processed, seen_targets)
+                  if self._native_refiner is not None else None)
 
         # 对每个目标遍历其所有出现位置
         for hw, approx_end_indices in seen_targets.items():
             for approx_end_idx in approx_end_indices:
-                for hw_phonemes in self.hotwords[hw]:
-                    hw_compare = [p.info[:5] for p in hw_phonemes]
+                for alias_index, hw_phonemes in enumerate(self.hotwords[hw]):
 
                     # [性能优化] 仅在 FastRAG 预测的结束位置附近进行搜索
                     # 窗口大小：热词长度 + 左右各 5 个音素的缓冲
-                    window_size = len(hw_compare) + 10
+                    window_size = len(hw_phonemes) + 10
                     window_start = max(0, approx_end_idx - window_size)
                     window_end = min(len(input_processed), approx_end_idx + 5)
 
-                    local_input = input_processed[window_start:window_end]
-
-                    # 搜索匹配
-                    found_segments = fuzzy_substring_search_constrained(hw_compare, local_input, threshold=search_threshold)
+                    found_segments = (native.search(hw, alias_index, window_start, window_end, search_threshold)
+                                      if native is not None else None)
+                    if found_segments is None:
+                        hw_compare = [p.info[:5] for p in hw_phonemes]
+                        local_input = input_processed[window_start:window_end]
+                        found_segments = fuzzy_substring_search_constrained(hw_compare, local_input, threshold=search_threshold)
 
                     for score, start_phon_idx, end_phon_idx in found_segments:
                         # 转换回全局索引
