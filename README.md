@@ -109,6 +109,8 @@ The vLLM adapter supports a **single GPU** and an **unquantized, merged checkpoi
 
 Audio encoding and CTC run in microbatches (`--prepare-batch-size 4`). For larger batches, CPU hotword retrieval overlaps preparation of the next microbatch. Features stay on the worker GPU by default; only IDs and lengths cross the process boundary. A 256 MiB request cache is released after generation, including on errors. `--embedding-transport cpu` provides the original feature-transfer path for comparison. `--batch-size` controls the number of utterances submitted together for final decoding.
 
+Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), including for single audio. Use `--rag-workers 1` for serial scoring. Matching scores and candidate order are preserved; each score matrix is limited to 16 MiB.
+
 See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The supported inference version remains **vLLM 0.22.1**.
 
 ## 🙏 Credits and license

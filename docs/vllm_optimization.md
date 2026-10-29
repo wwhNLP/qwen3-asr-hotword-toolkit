@@ -157,8 +157,8 @@ coarse scoring takes 153.6 ms with sequential `extract`, versus 143.5 / 76.1 /
 match exactly on those inputs. These timings include matrix filtering and
 ranking, but exclude alignment/masking, weighted refinement, and ASR. The
 3.7x coarse-stage improvement is therefore **not an end-to-end speedup**.
-This prototype is not enabled in the runtime; integrating it requires a batch
-retrieval API and broader ranking/threshold, concurrency and end-to-end checks.
+That prototype only parallelized across utterances. The integrated version
+below also parallelizes across vocabulary entries, including for single audio.
 Another option is moving weighted refinement out of Python. Python threads
 alone cannot parallelize that loop while it holds the GIL.
 
@@ -168,6 +168,91 @@ eight audio paths to `--audio`. For a single path, use `--mode asr`, `--mode ctc
 or `--mode ctc_rag`; `--mode ctc_rag --max-ctx-hotwords 0` runs CTC without
 retrieval. Raw reports, query comparisons and logs are saved locally under
 `artifacts/context-optimization/round2/` (excluded from Git).
+
+## Native CPU retrieval and GPU tradeoffs
+
+The 68 ms retrieval figure above comes from an earlier public-audio profile;
+it is not a fixed cost for every input. Vocabulary size, phoneme length and
+the number of coarse matches determine the work. This retrieval operates on
+phoneme sequences: text normalization/pinyin conversion, full-vocabulary fuzzy
+scoring, alignment and masking with OSA distance, then weighted edit-distance
+refinement with word boundaries, aliases and contextual blacklists.
+
+The integrated CPU optimization adds `PhonemeCorrector.correct_batch` and
+`FastRAG.search_batch`. Native RapidFuzz `cdist` workers divide the vocabulary
+dimension, so one utterance can also use multiple cores. `partial_ratio`
+scores are symmetric; alignment/masking retains the original input/hotword
+orientation. Float64 scores and stable sorting retain scalar ranking and ties.
+The accelerated path holds one vocabulary/blacklist snapshot for the microbatch;
+`workers=1` retains the original per-utterance serial behavior. Score matrices
+are chunked to at most 16 MiB each, with scalar fallback if a single query would
+exceed that budget. Each call uses at most `--rag-workers` native workers
+(default 4), rather than all available CPU cores.
+
+Measured on physical GPU 3 (A800-SXM4-80GB) with the same completed 0.6B
+checkpoint, eight AISHELL dev inputs, 12,286-term vocabulary, preparation
+microbatch 4, compiled vLLM 0.22.1, disabled prefix caching, model length 1024,
+96-token generation cap and GPU memory utilization 0.12. CPU worker counts
+1 / 2 / 4 are shuffled within each of fifteen timed rounds after three warmup
+batches per case, in one resident engine. Audio reading and startup are excluded.
+
+| Batch | Serial retrieval P50 | 4-worker retrieval P50 | Serial full pipeline P50 | 4-worker full pipeline P50 | Full pipeline reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 51.2 ms | 38.8 ms | 96.7 ms | 84.3 ms | 12.8% |
+| 4 | 189.3 ms | 116.9 ms | 263.9 ms | 191.5 ms | 27.4% |
+| 8 | 358.9 ms | 234.9 ms | 453.5 ms | 329.3 ms | 27.4% |
+
+Times are for the whole batch. Retrieval phase medians sum the retrieval calls
+within a request; preparation can overlap those calls. For the single input,
+serial → 4-worker phase P50 is approximately: phoneme conversion 0.54 → 0.54 ms,
+coarse scoring 22.44 → 9.16 ms, alignment 5.41 → 5.41 ms, weighted refinement
+22.67 → 22.56 ms. Phase medians need not sum to the total median.
+Weighted refinement is now the largest remaining retrieval stage.
+
+All timed cases produce identical CTC text, ranked hotwords and final
+transcriptions. Full correction results also match the preceding source
+snapshot on 135 queries (134 distinct), with another 1,100 randomized retrieval
+queries covering long phoneme sequences and varied cutoffs. Unit checks cover
+aliases, blacklists, vocabulary replacement, empty inputs, ties, matrix memory
+limits, overlap, and cleanup on errors. Validation passed 61 general CPU checks,
+eight phoneme/compatibility checks in the inference environment, and six real
+GPU integration tests with default compilation/CUDA Graphs. These small measurements establish P50
+improvements, not corpus accuracy or concurrent-serving guarantees. In
+particular, single-input P95 was 108.2 ms serial versus 109.7 ms with four
+workers; a tail-latency improvement has not been demonstrated.
+
+Pass `--rag-workers 1` or `--rag-workers 4` to either `infer_vllm.py` or
+`scripts/benchmark_vllm.py` for serial/native scoring. Reports and the resident
+engine comparison script are stored locally in
+`artifacts/context-optimization/round3/` (excluded from Git).
+
+### Why CPU, and what would GPU execution require?
+
+From the implementation, the engineering advantages of CPU retrieval are
+reuse of RapidFuzz and pinyin/string-processing libraries, direct handling of
+variable-length text and rule checks, and overlap with other audio's GPU
+encoding. This is an explanation of the current structure, not a documented
+statement of the upstream author's intent. RapidFuzz's native scorers can
+release the GIL and use CPU workers; the Python refinement loop still runs
+serially. See the [RapidFuzz process API](https://rapidfuzz.github.io/RapidFuzz/Usage/process.html).
+
+GPU string matching is possible: [NVIDIA cuDF exposes Levenshtein edit
+distance](https://docs.nvidia.com/cudf/26.10/cudf/api_docs/api/cudf.core.accessors.string.StringMethods.edit_distance/).
+That primitive does not implement this pipeline's partial-ratio/OSA filtering,
+phoneme-specific costs, start/end constraints and stable candidate selection.
+Replacing these with plain edit distance changes the retrieval algorithm.
+
+A compatible GPU path would pre-encode the vocabulary, pack variable-length
+phoneme IDs and boundary flags, and batch coarse scoring or weighted refinement
+in a CUDA/Triton kernel. Pinyin conversion and blacklist processing can remain
+on the CPU; the measured conversion cost is only around 0.5 ms for this input.
+Integration must schedule the new kernel in the vLLM worker and measure its
+RPC/synchronization costs and contention with encoding/decoding. Keeping the
+dictionary resident and batching transfers/kernels follows the [CUDA best
+practices guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html).
+Neither a GPU implementation nor a GPU speedup is established by the current
+CPU measurements. The next useful targets are native weighted refinement or a
+batched GPU refinement kernel, preserving current scoring and boundary rules.
 
 ## vLLM 0.26: scope and difficulty
 
