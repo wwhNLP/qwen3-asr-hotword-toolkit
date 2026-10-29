@@ -111,6 +111,8 @@ Audio encoding and CTC run in microbatches (`--prepare-batch-size 4`). For large
 
 Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), including for single audio. Use `--rag-workers 1` for serial scoring. Matching scores and candidate order are preserved; each score matrix is limited to 16 MiB.
 
+Weighted refinement uses Numba when available (`--rag-refiner auto`, the default). Vocabulary loading prepares the compiled kernel before inference. Select `python` or `numba` explicitly for comparisons. The vLLM extra includes Numba; standalone hotword users can install `.[rag-native]`.
+
 See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The supported inference version remains **vLLM 0.22.1**.
 
 ## 🙏 Credits and license
