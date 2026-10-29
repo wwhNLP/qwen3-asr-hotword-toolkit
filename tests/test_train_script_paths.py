@@ -37,7 +37,7 @@ class TrainScriptPathsTest(unittest.TestCase):
         )
 
     def test_sft_defaults_use_project_paths_from_any_directory(self):
-        result = self.run_script()
+        result = self.run_script("sft")
         self.assertEqual(result.returncode, 0, result.stderr)
         args = result.stdout.splitlines()
         self.assertEqual(args[args.index("--model") + 1], str(self.root / "model/Qwen3-ASR-0.6B"))
@@ -68,13 +68,13 @@ class TrainScriptPathsTest(unittest.TestCase):
         args = result.stdout.splitlines()
         self.assertEqual(args[args.index("--model") + 1], "/chosen/checkpoint")
 
-    def test_sft_accepts_extra_arguments_without_stage(self):
-        result = self.run_script("--max_steps", "2")
+    def test_default_stage_accepts_extra_arguments_without_stage(self):
+        result = self.run_script("--max_steps", "2", env={**self.env, "MODEL_PATH": "/chosen/model"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-2:], ["--max_steps", "2"])
 
     def test_default_two_gpu_data_parallel_batch(self):
-        result = self.run_script()
+        result = self.run_script("sft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "swift-env.txt").read_text().splitlines(), ["3,6", "2", "29531"])
         args = result.stdout.splitlines()
@@ -83,7 +83,7 @@ class TrainScriptPathsTest(unittest.TestCase):
 
     def test_gpu_selection_can_be_overridden(self):
         env = {**self.env, "CUDA_VISIBLE_DEVICES": "1", "MASTER_PORT": "29532"}
-        result = self.run_script(env=env)
+        result = self.run_script("sft", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "swift-env.txt").read_text().splitlines(), ["1", "1", "29532"])
         args = result.stdout.splitlines()
