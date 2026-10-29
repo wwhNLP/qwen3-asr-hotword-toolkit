@@ -101,6 +101,21 @@ class NativeRefinementTest(unittest.TestCase):
         # A failed update retains the preceding vocabulary/refiner snapshot.
         self.assertEqual(explicit.correct("广洲"), expected)
 
+    def test_auto_falls_back_when_numba_initialization_fails(self):
+        from hotword import PhonemeCorrector
+        from hotword import native_refine
+
+        automatic = PhonemeCorrector(refiner="auto")
+        reference = PhonemeCorrector(refiner="python")
+        reference.update_hotwords("广州")
+        for error in (AttributeError("coverage.types.Tracer"), RuntimeError("JIT failed")):
+            with self.subTest(error=error), patch.object(native_refine, "NativeRefiner", side_effect=error):
+                automatic.update_hotwords("广州")
+                self.assertEqual(automatic.refiner_backend, "python")
+                self.assertEqual(automatic.correct("广洲"), reference.correct("广洲"))
+                with self.assertRaisesRegex(RuntimeError, "Numba refinement is unavailable"):
+                    PhonemeCorrector(refiner="numba").update_hotwords("广州")
+
 
 if __name__ == "__main__":
     unittest.main()

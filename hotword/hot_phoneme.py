@@ -110,10 +110,10 @@ class PhonemeCorrector:
             try:
                 from .native_refine import NativeRefiner
                 native_refiner = NativeRefiner(new_hotwords)
-            except ImportError as exc:
+            except Exception as exc:
                 if self.refiner == "numba":
                     raise RuntimeError("Numba refinement is unavailable; check the Numba installation and JIT settings.") from exc
-                logger.debug("Native refinement unavailable; using Python: %s", exc)
+                logger.warning("Native refinement unavailable; using Python: %s", exc)
         with self._lock:
             self.hotwords = new_hotwords
             self.blacklists = new_blacklists
