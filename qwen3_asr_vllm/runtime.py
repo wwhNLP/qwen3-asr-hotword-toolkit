@@ -52,6 +52,7 @@ class VLLMContextASR:
         max_audio_seconds=30,
         prepare_batch_size=4,
         embedding_transport="device",
+        rag_workers=4,
         **engine_kwargs,
     ):
         if mode not in {"asr", "ctc", "ctc_rag"}:
@@ -62,6 +63,8 @@ class VLLMContextASR:
             raise ValueError("prepare_batch_size must be a positive integer.")
         if embedding_transport not in {"device", "cpu"}:
             raise ValueError("embedding_transport must be device or cpu.")
+        if type(rag_workers) is not int or rag_workers < 1:
+            raise ValueError("rag_workers must be a positive integer.")
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
         if version("vllm").split("+")[0] != "0.22.1":
@@ -89,6 +92,7 @@ class VLLMContextASR:
             self._corrector.update_hotwords(hotword_text)
         self.prepare_batch_size = prepare_batch_size
         self.embedding_transport = embedding_transport
+        self.rag_workers = rag_workers
         self.max_ctx_hotwords = max_ctx_hotwords
 
         register()
@@ -180,13 +184,20 @@ class VLLMContextASR:
                     self.llm.collective_rpc("context_release", args=(cached_ids,))
 
     def _finish_context_batch(self, items, manual_hotwords):
-        for item in items:
+        retrieval = None
+        if self.mode == "ctc_rag" and self.max_ctx_hotwords:
+            retrieval = self._corrector.correct_batch(
+                [item["rough"] for item in items], k=self.max_ctx_hotwords,
+                workers=self.rag_workers,
+            )
+            if len(retrieval) != len(items):
+                raise RuntimeError("Retriever returned an unexpected number of results.")
+        for index, item in enumerate(items):
             hotwords = manual_hotwords
             if self.mode == "ctc_rag":
                 hotwords = []
                 if self.max_ctx_hotwords:
-                    result = self._corrector.correct(item["rough"], k=self.max_ctx_hotwords)
-                    hotwords = select_hotwords(result, self.max_ctx_hotwords)
+                    hotwords = select_hotwords(retrieval[index], self.max_ctx_hotwords)
             item["hotwords"] = hotwords
             if self.mode != "ctc":
                 system = "可能出现的热词：" + "，".join(hotwords) if hotwords else ""

@@ -27,11 +27,15 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime.max_audio_samples = 16000
         runtime.prepare_batch_size = 2
         runtime.embedding_transport = transport
+        runtime.rag_workers = 4
         runtime.max_ctx_hotwords = 8
         runtime.sampling_params = object()
         runtime._lock = Lock()
         runtime._processor = SimpleNamespace(apply_chat_template=Mock(side_effect=lambda messages, **kw: str(messages)))
         runtime._corrector = SimpleNamespace(correct=Mock(return_value=SimpleNamespace(matches=[("错词", "热词", 1)], similars=[])))
+        runtime._corrector.correct_batch = Mock(side_effect=lambda texts, k, workers: [
+            runtime._corrector.correct(text, k=k) for text in texts
+        ])
         features = torch.randn(13, 8)
         next_id = 0
 
@@ -63,6 +67,11 @@ class VLLMRuntimeTest(unittest.TestCase):
         self.assertEqual([item["rough"] for item in outputs], ["粗转写1", "粗转写2", "粗转写3"])
         self.assertTrue(all(item["hotwords"] == ["热词"] for item in outputs))
         self.assertEqual(worker.context_prepare_batch.call_count, 2)
+        self.assertEqual(runtime._corrector.correct_batch.call_count, 2)
+        self.assertEqual(runtime._corrector.correct_batch.call_args_list[0].args[0],
+                         ["粗转写1", "粗转写2"])
+        self.assertEqual(runtime._corrector.correct_batch.call_args_list[0].kwargs,
+                         {"k": 8, "workers": 4})
         sent_audio = worker.context_prepare_batch.call_args_list[0].args[0]
         for data, wave in zip(sent_audio, waves):
             np.testing.assert_array_equal(np.frombuffer(data, dtype=np.float32), wave)
@@ -153,6 +162,27 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime, _, _ = self.make_runtime("ctc_rag")
         self.assertEqual(runtime.transcribe_batch([]), [])
         runtime.llm.collective_rpc.assert_not_called()
+
+    def test_wrong_retrieval_result_count_releases_contexts(self):
+        runtime, worker, _ = self.make_runtime("ctc_rag")
+        runtime._corrector.correct_batch.side_effect = None
+        runtime._corrector.correct_batch.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "Retriever returned"):
+            runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+        worker.context_release.assert_called_once_with([1, 2])
+        runtime.llm.generate.assert_not_called()
+
+    def test_zero_hotword_limit_skips_retrieval(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime.max_ctx_hotwords = 0
+        outputs = runtime.transcribe_batch([np.zeros(1600), np.zeros(3200)])
+        runtime._corrector.correct_batch.assert_not_called()
+        self.assertEqual([item["hotwords"] for item in outputs], [[], []])
+
+    def test_invalid_retrieval_workers_fail_before_engine_start(self):
+        for workers in (0, -1, True, 1.5):
+            with self.subTest(workers=workers), self.assertRaisesRegex(ValueError, "rag_workers"):
+                VLLMContextASR("unused", rag_workers=workers)
 
 
 class EmbeddingCacheTest(unittest.TestCase):

@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--prepare-batch-size", type=int)
+    parser.add_argument("--rag-workers", type=int, help="Native CPU retrieval workers; 1 selects serial scoring")
     parser.add_argument("--embedding-transport", choices=("device", "cpu"))
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -37,12 +38,16 @@ def main():
         parser.error("Batch sizes/repeats must be positive and warmup nonnegative.")
     if args.max_ctx_hotwords < 0 or (args.ablation and args.max_ctx_hotwords == 0):
         parser.error("Hotword limit must be nonnegative (positive for ablation).")
+    if args.rag_workers is not None and args.rag_workers < 1:
+        parser.error("--rag-workers must be positive.")
     ensure_output_not_input(args.output, [*args.audio, *([args.hot_txt] if args.hot_txt else [])])
     extra = {}
     if args.prepare_batch_size is not None:
         extra["prepare_batch_size"] = args.prepare_batch_size
     if args.embedding_transport is not None:
         extra["embedding_transport"] = args.embedding_transport
+    if args.rag_workers is not None:
+        extra["rag_workers"] = args.rag_workers
     engine = VLLMContextASR(
         args.model, mode="ctc_rag" if args.ablation else args.mode,
         hot_txt=args.hot_txt, max_ctx_hotwords=args.max_ctx_hotwords,
@@ -58,6 +63,7 @@ def main():
               "hot_txt": str(args.hot_txt) if args.hot_txt else None,
               "prepare_batch_size": getattr(engine, "prepare_batch_size", None),
               "embedding_transport": getattr(engine, "embedding_transport", None),
+              "rag_workers": getattr(engine, "rag_workers", None),
               "max_model_len": args.max_model_len,
               "max_new_tokens": args.max_new_tokens,
               "gpu_memory_utilization": args.gpu_memory_utilization,
