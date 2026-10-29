@@ -41,7 +41,7 @@ class PhonemeCorrector:
     拼音纠错器
 
     使用两阶段检索策略：
-    1. FastRAG 粗筛：使用倒排索引快速过滤候选
+    1. FastRAG 粗筛：使用 RapidFuzz 全词表匹配过滤候选
     2. 精筛：使用模糊音权重编辑距离进行精确匹配
 
     并将相似度超过阈值的片段替换为热词。
@@ -279,22 +279,35 @@ class PhonemeCorrector:
         with self._lock:
             # 粗筛
             fast_results = self.fast_rag.search(input_phonemes, top_k=0)
+            return self._correct_from_candidates(text, input_phonemes, fast_results, k, window)
 
-            # 预处理输入 (转换为全能七元组：值, 语言, 字始, 字终, 是调, 始位, 终位)
-            try:
-                input_processed = [p.info for p in input_phonemes]
-            except Exception as e:
-                logger.error(f"[ERROR] Failed to build input_processed: {e}")
-                logger.error(f"[ERROR] input_phonemes details: {[(type(p), p) for p in input_phonemes[:5]]}")
-                raise
+    def correct_batch(self, texts: List[str], k: int = 10, blacklist_window: int = 5,
+                      workers: int = 4) -> List[CorrectionResult]:
+        """Batch native scoring; workers=1 retains per-utterance serial calls."""
+        if type(workers) is not int or workers < 1:
+            raise ValueError("workers must be a positive integer.")
+        if not texts or workers == 1:
+            return [self.correct(text, k, blacklist_window) for text in texts]
+        with self._lock:
+            if not self.hotwords:
+                return [CorrectionResult(text, [], []) for text in texts]
+            phonemes = [get_phoneme_info(text) if text else [] for text in texts]
+            candidates = self.fast_rag.search_batch(phonemes, top_k=0, workers=workers)
+            return [self._correct_from_candidates(text, phones, matches, k, blacklist_window)
+                    if phones else CorrectionResult(text, [], [])
+                    for text, phones, matches in zip(texts, phonemes, candidates)]
 
-            # 精筛
-            matches, similars = self._find_matches(text, fast_results, input_processed, window)
+    def _correct_from_candidates(self, text, input_phonemes, fast_results, k, window):
+        """Caller holds _lock through matching and replacement."""
+        try:
+            input_processed = [p.info for p in input_phonemes]
+        except Exception as e:
+            logger.error(f"[ERROR] Failed to build input_processed: {e}")
+            logger.error(f"[ERROR] input_phonemes details: {[(type(p), p) for p in input_phonemes[:5]]}")
+            raise
 
-            # Keep the same hotword/blacklist snapshot for matching and replacement.
-            new_text, final_hw_info, _ = self._resolve_and_replace(text, matches, window)
-        
-        # similars 已经是 [(origin, hw, score), ...] 的元组列表
+        matches, similars = self._find_matches(text, fast_results, input_processed, window)
+        new_text, final_hw_info, _ = self._resolve_and_replace(text, matches, window)
         return CorrectionResult(text=new_text, matches=final_hw_info, similars=similars[:k])
 
 
