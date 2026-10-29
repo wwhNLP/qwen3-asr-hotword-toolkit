@@ -15,6 +15,8 @@ import rapidfuzz.process as _process
 
 # Bound the float64 score matrix independently of caller batch/vocabulary size.
 _MAX_SCORE_MATRIX_BYTES = 16 * 1024 * 1024
+# Starting native workers costs more than a few dozen fuzzy comparisons.
+_MIN_PARALLEL_COMPARISONS = 128
 
 
 class FastRAG:
@@ -75,7 +77,9 @@ class FastRAG:
         """Batch coarse scoring in native CPU workers; preserve scalar ranking."""
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive integer.")
-        if not inputs or workers == 1 or not self.hotwords:
+        comparisons = len(self.hotwords) * sum(bool(phonemes) for phonemes in inputs)
+        if (not inputs or workers == 1 or not self.hotwords
+                or comparisons < _MIN_PARALLEL_COMPARISONS):
             return [self.search(phonemes, top_k) for phonemes in inputs]
 
         import numpy as np

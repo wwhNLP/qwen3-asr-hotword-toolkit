@@ -67,10 +67,18 @@ class PhonemeCorrector:
 
     def update_hotwords(self, hotword_text: str) -> int:
         """更新纠错热词库 (线程安全)"""
+        return self._update_hotword_lines(hotword_text.splitlines(), skip_comments=True, phoneme_lookup=None)
+
+    def update_hotword_entries(self, entries: List[str], *, phoneme_lookup=None) -> int:
+        """Update from explicit entries, including words beginning with '#'."""
+        return self._update_hotword_lines(entries, skip_comments=False, phoneme_lookup=phoneme_lookup)
+
+    def _update_hotword_lines(self, values, *, skip_comments, phoneme_lookup):
         start_time = time.time()
         
         # 预析取有效行
-        lines = [line.strip() for line in hotword_text.splitlines() if line.strip() and not line.strip().startswith('#')]
+        lines = [line.strip() for line in values
+                 if line.strip() and not (skip_comments and line.strip().startswith('#'))]
         
         new_hotwords: Dict[str, List[List[Phoneme]]] = {}
         new_blacklists: Dict[str, Set[str]] = {}
@@ -87,7 +95,7 @@ class PhonemeCorrector:
             
             phoneme_lists = []
             for part in parts:
-                phons = get_phoneme_info(part)
+                phons = list(phoneme_lookup(part)) if phoneme_lookup else get_phoneme_info(part)
                 if phons:
                     phoneme_lists.append(phons)
             
