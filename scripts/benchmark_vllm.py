@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--prepare-batch-size", type=int)
     parser.add_argument("--rag-workers", type=int, help="Native CPU retrieval workers; 1 selects serial scoring")
+    parser.add_argument("--rag-refiner", choices=("auto", "python", "numba"))
     parser.add_argument("--embedding-transport", choices=("device", "cpu"))
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -48,6 +49,8 @@ def main():
         extra["embedding_transport"] = args.embedding_transport
     if args.rag_workers is not None:
         extra["rag_workers"] = args.rag_workers
+    if args.rag_refiner is not None:
+        extra["rag_refiner"] = args.rag_refiner
     engine = VLLMContextASR(
         args.model, mode="ctc_rag" if args.ablation else args.mode,
         hot_txt=args.hot_txt, max_ctx_hotwords=args.max_ctx_hotwords,
@@ -64,6 +67,7 @@ def main():
               "prepare_batch_size": getattr(engine, "prepare_batch_size", None),
               "embedding_transport": getattr(engine, "embedding_transport", None),
               "rag_workers": getattr(engine, "rag_workers", None),
+              "rag_refiner": getattr(getattr(engine, "_corrector", None), "refiner_backend", None),
               "max_model_len": args.max_model_len,
               "max_new_tokens": args.max_new_tokens,
               "gpu_memory_utilization": args.gpu_memory_utilization,

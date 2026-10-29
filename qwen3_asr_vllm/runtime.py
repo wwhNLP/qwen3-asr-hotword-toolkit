@@ -53,6 +53,7 @@ class VLLMContextASR:
         prepare_batch_size=4,
         embedding_transport="device",
         rag_workers=4,
+        rag_refiner="auto",
         **engine_kwargs,
     ):
         if mode not in {"asr", "ctc", "ctc_rag"}:
@@ -65,6 +66,8 @@ class VLLMContextASR:
             raise ValueError("embedding_transport must be device or cpu.")
         if type(rag_workers) is not int or rag_workers < 1:
             raise ValueError("rag_workers must be a positive integer.")
+        if rag_refiner not in {"auto", "python", "numba"}:
+            raise ValueError("rag_refiner must be auto, python or numba.")
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
         if version("vllm").split("+")[0] != "0.22.1":
@@ -88,11 +91,12 @@ class VLLMContextASR:
         self._corrector = None
         if mode == "ctc_rag":
             from hotword import PhonemeCorrector
-            self._corrector = PhonemeCorrector(threshold=rag_threshold)
+            self._corrector = PhonemeCorrector(threshold=rag_threshold, refiner=rag_refiner)
             self._corrector.update_hotwords(hotword_text)
         self.prepare_batch_size = prepare_batch_size
         self.embedding_transport = embedding_transport
         self.rag_workers = rag_workers
+        self.rag_refiner = rag_refiner
         self.max_ctx_hotwords = max_ctx_hotwords
 
         register()

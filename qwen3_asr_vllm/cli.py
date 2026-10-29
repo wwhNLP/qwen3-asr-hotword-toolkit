@@ -30,6 +30,7 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--prepare-batch-size", type=int, default=4, help="Audio encoder/CTC microbatch size")
     parser.add_argument("--rag-workers", type=int, default=4, help="Native CPU retrieval workers; 1 uses serial scoring")
+    parser.add_argument("--rag-refiner", choices=("auto", "python", "numba"), default="auto", help="Weighted matching backend; auto uses Numba when available")
     parser.add_argument("--embedding-transport", choices=("device", "cpu"), default="device", help="Keep features on the worker GPU or transfer through CPU")
     parser.add_argument("--dtype", choices=("auto", "float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -89,6 +90,7 @@ def main(argv=None):
         max_audio_seconds=args.max_audio_seconds,
         prepare_batch_size=args.prepare_batch_size,
         rag_workers=args.rag_workers,
+        rag_refiner=args.rag_refiner,
         embedding_transport=args.embedding_transport,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
