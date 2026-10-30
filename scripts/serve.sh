@@ -5,7 +5,8 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # Deployment configuration. Paths are relative to the project directory.
 MODEL_DIR="$PROJECT_DIR/checkpoint"
-HOTWORD_FILE="$PROJECT_DIR/train_hotwords.txt"
+HOTWORD_FILE="" # Optional: set a project-relative vocabulary path.
+MODE=ctc_rag
 GPU_ID=0
 HOST=127.0.0.1
 PORT=8900
@@ -29,7 +30,7 @@ if [[ ! -f "$MODEL_DIR/model.safetensors" && ! -f "$MODEL_DIR/model.safetensors.
   printf 'Model weights or shard index not found in %s.\n' "$MODEL_DIR" >&2
   exit 1
 fi
-if [[ ! -f "$HOTWORD_FILE" ]]; then
+if [[ -n "$HOTWORD_FILE" && ! -f "$HOTWORD_FILE" ]]; then
   printf 'Hotword file not found: %s\n' "$HOTWORD_FILE" >&2
   exit 1
 fi
@@ -48,9 +49,13 @@ export HF_HUB_OFFLINE=1
 export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/.venv-uv"
 
 cd "$PROJECT_DIR"
+hotword_args=()
+if [[ -n "$HOTWORD_FILE" ]]; then
+  hotword_args=(--hot-txt "$HOTWORD_FILE")
+fi
 exec uv run --no-sync python -m qwen3_asr_vllm.server \
   --model "$MODEL_DIR" \
-  --hot-txt "$HOTWORD_FILE" \
+  --mode "$MODE" "${hotword_args[@]}" \
   --host "$HOST" --port "$PORT" \
   --max-ctx-hotwords "$MAX_HOTWORDS" --rag-workers "$RAG_WORKERS" \
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --kv-cache-mib "$KV_CACHE_MIB" \

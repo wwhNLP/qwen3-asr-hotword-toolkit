@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from qwen3_asr_vllm.runtime import VLLMContextASR, select_hotwords, _validate_vllm_version
+from qwen3_asr_vllm.correction import correct_explicit_aliases, normalize_mixed_identifiers
 from qwen3_asr_vllm.requests import RequestPhonemeCache, RequestVocabularyCache
 from qwen3_asr_vllm.transport import EmbeddingCache, pack_embeddings, unpack_embeddings
 
@@ -23,6 +24,27 @@ class VLLMVersionTest(unittest.TestCase):
 
 
 class HotwordSelectionTest(unittest.TestCase):
+    def test_mixed_identifier_only_rewrites_selected_exact_letter_sequences(self):
+        text = "SpO二和f i o 二，XSpO二保持，FiO三保持"
+        corrected, count = normalize_mixed_identifiers(text, ["SpO2", "FiO2"])
+        self.assertEqual(corrected, "SpO2和FiO2，XSpO二保持，FiO三保持")
+        self.assertEqual(count, 2)
+
+    def test_only_explicit_unambiguous_aliases_are_replaced(self):
+        corrector = SimpleNamespace(explicit_aliases={"康辉": ("康灰",), "公司": (),
+                                                       "Claude": ("cloud",)},
+                                    blacklists={"康辉": {"央视"}})
+        self.assertEqual(correct_explicit_aliases("康灰区分公私，cloud Cloudy", corrector,
+                                                  ["康辉", "公司", "Claude"]),
+                         ("康辉区分公私，Claude Cloudy", 2))
+        self.assertEqual(correct_explicit_aliases("央视康灰", corrector, ["康辉"]), ("央视康灰", 0))
+        corrector.explicit_aliases["另一个人"] = ("康灰",)
+        self.assertEqual(correct_explicit_aliases("康灰", corrector, ["康辉", "另一个人"]), ("康灰", 0))
+        self.assertEqual(correct_explicit_aliases("康灰", corrector, ["康辉"]), ("康灰", 0))
+        corrector.explicit_aliases["阿里巴巴"] = ("巴巴",)
+        self.assertEqual(correct_explicit_aliases("阿里巴巴和巴巴", corrector, ["阿里巴巴"]),
+                         ("阿里巴巴和阿里巴巴", 1))
+
     def test_matches_precede_similars_and_are_deduplicated(self):
         result = SimpleNamespace(
             matches=[("甲", "热词甲", 1.0), ("乙", "热词乙", 0.9)],
@@ -114,10 +136,32 @@ class VLLMRuntimeTest(unittest.TestCase):
     def test_asr_mode_uses_manual_hotwords_without_retrieval(self):
         runtime, _, _ = self.make_runtime("asr")
         output = runtime.transcribe(np.zeros(1600), hotwords=["手工热词"])
-        self.assertEqual(output, {"mode": "asr", "text": "最终转写"})
+        self.assertEqual(output, {"mode": "asr", "text": "最终转写", "hotwords": ["手工热词"],
+                                  "hotword_stats": {"injected": 1, "literal_hits": 0, "replacements": 0}})
         messages = runtime._processor.apply_chat_template.call_args.args[0]
         self.assertEqual(messages[0]["content"], "可能出现的热词：手工热词")
         runtime._corrector.correct.assert_not_called()
+
+    def test_decoder_length_limit_is_reported(self):
+        runtime, _, _ = self.make_runtime("asr")
+        runtime.llm.generate.side_effect = None
+        runtime.llm.generate.return_value = [SimpleNamespace(outputs=[SimpleNamespace(text="未完成", finish_reason="length")])]
+        result = runtime.transcribe(np.zeros(1600))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["finish_reason"], "length")
+
+    def test_alias_correction_operates_on_final_text_and_reports_counts(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime._corrector.explicit_aliases = {"康辉": ("康灰",)}
+        runtime._corrector.blacklists = {}
+        runtime._corrector.correct.return_value = SimpleNamespace(matches=[("康灰", "康辉", 1.0)], similars=[])
+        runtime.llm.generate.side_effect = None
+        runtime.llm.generate.return_value = [SimpleNamespace(outputs=[SimpleNamespace(text="主持人康灰")])]
+        result = runtime.transcribe(np.zeros(1600))
+        self.assertEqual(result["text"], "主持人康辉")
+        self.assertEqual(result["rough"], "粗转写1")
+        self.assertEqual(result["hotword_stats"], {"injected": 1, "retrieved": 1, "fallback": 0,
+                                                   "literal_hits": 1, "replacements": 1})
 
     def test_asr_prompt_uses_targets_not_aliases_or_blacklists(self):
         runtime, _, _ = self.make_runtime("asr")
@@ -239,6 +283,20 @@ class VLLMRuntimeTest(unittest.TestCase):
         runtime.clear_request_cache()
         self.assertEqual(runtime.request_cache_info()["entries"], 0)
         self.assertEqual(runtime.request_cache_info()["hits"], 0)
+
+    def test_small_request_vocabulary_survives_ctc_retrieval_misses(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime._create_request_corrector = Mock(return_value=SimpleNamespace(
+            refiner_backend="python", correct_batch=Mock(side_effect=lambda texts, **kw: [
+                SimpleNamespace(matches=[], similars=[]) for _ in texts])))
+        wave = np.zeros(1600)
+        self.assertEqual(runtime.transcribe(wave, hotwords=["PSG", "REM"])["hotwords"], ["PSG", "REM"])
+        result = runtime.transcribe(wave, hotwords=["PSG", "REM"])
+        self.assertEqual(result["retrieved_hotwords"], [])
+        self.assertEqual(result["hotword_stats"]["fallback"], 2)
+        self.assertEqual(runtime.transcribe(wave, hotwords=["PSG", "REM"], max_ctx_hotwords=1)["hotwords"], ["PSG"])
+        self.assertEqual(runtime.transcribe(wave, hotwords=["a", "b", "c", "d", "e"])["hotwords"], [])
+        self.assertEqual(runtime.transcribe(wave, hotwords=["康辉~~~央视"])["hotwords"], [])
 
     def test_request_generation_limits_do_not_modify_engine_defaults(self):
         runtime, _, _ = self.make_runtime("asr")

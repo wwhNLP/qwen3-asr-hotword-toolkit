@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from .batching import BatchQueueFull, DynamicBatcher
-from .requests import normalize_options
+from .requests import normalize_options, validate_mode_options
 from .runtime import VLLMContextASR, read_audio
 
 
@@ -42,6 +42,8 @@ def create_app(engine, *, max_audio_bytes=64 * 1024 * 1024,
     """Create an app around one already-loaded engine."""
     batcher = DynamicBatcher(engine, max_batch_size=max_batch_size,
                              max_wait_ms=max_batch_wait_ms, max_queue_size=max_queue_size)
+    metrics = {"requests": 0, "injected": 0, "retrieved": 0, "fallback": 0,
+               "literal_hits": 0, "replacements": 0, "truncated": 0}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -61,9 +63,16 @@ def create_app(engine, *, max_audio_bytes=64 * 1024 * 1024,
     async def batching_info():
         return batcher.info()
 
+    @app.get("/v1/metrics")
+    async def transcription_metrics():
+        return dict(metrics)
+
     @app.get("/v1/hotwords")
     async def hotword_info():
-        return await run_in_threadpool(engine.hotword_info)
+        try:
+            return await run_in_threadpool(engine.hotword_info)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.put("/v1/hotwords")
     async def replace_hotwords(request: Request):
@@ -78,7 +87,10 @@ def create_app(engine, *, max_audio_bytes=64 * 1024 * 1024,
             text = b"".join(chunks).decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise HTTPException(400, "Vocabulary must be UTF-8 text.") from exc
-        return await run_in_threadpool(engine.update_hotwords, text)
+        try:
+            return await run_in_threadpool(engine.update_hotwords, text)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post("/v1/audio/transcriptions")
     async def transcribe(
@@ -90,13 +102,19 @@ def create_app(engine, *, max_audio_bytes=64 * 1024 * 1024,
         try:
             words = json.loads(hotwords) if hotwords is not None else None
             # Validate before acquiring the model or decoding uploaded audio.
-            normalize_options(1, hotwords=words,
-                              request_options=[{"max_ctx_hotwords": max_ctx_hotwords,
-                                                "max_new_tokens": max_new_tokens}])
+            normalized = normalize_options(1, hotwords=words,
+                                           request_options=[{"max_ctx_hotwords": max_ctx_hotwords,
+                                                             "max_new_tokens": max_new_tokens}])
+            validate_mode_options(getattr(engine, "mode", "ctc_rag"), normalized)
             waveform = await run_in_threadpool(_decode_audio, file, engine.max_audio_samples, max_audio_bytes)
             options = {"hotwords": words, "max_ctx_hotwords": max_ctx_hotwords,
                        "max_new_tokens": max_new_tokens}
-            return await batcher.submit(waveform, options)
+            result = await batcher.submit(waveform, options)
+            metrics["requests"] += 1
+            for key in ("injected", "retrieved", "fallback", "literal_hits", "replacements"):
+                metrics[key] += result.get("hotword_stats", {}).get(key, 0)
+            metrics["truncated"] += int(result.get("truncated", False))
+            return result
         except BatchQueueFull as exc:
             raise HTTPException(503, "Inference queue is full; retry later.") from exc
         except (ValueError, json.JSONDecodeError) as exc:
@@ -110,7 +128,8 @@ def create_app(engine, *, max_audio_bytes=64 * 1024 * 1024,
 def main():
     parser = argparse.ArgumentParser(description="Serve Qwen3-ASR CTC+RAG over HTTP (one GPU).")
     parser.add_argument("--model", required=True, help="Merged checkpoint with a trained CTC branch")
-    parser.add_argument("--hot-txt", required=True, help="Initial UTF-8 hotword file")
+    parser.add_argument("--mode", choices=("asr", "ctc", "ctc_rag"), default="ctc_rag")
+    parser.add_argument("--hot-txt", help="Initial UTF-8 hotword file (default: empty vocabulary)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8900)
     parser.add_argument("--max-ctx-hotwords", type=int, default=10)
@@ -137,7 +156,7 @@ def main():
     cache_options = {} if args.kv_cache_mib is None else {
         "kv_cache_memory_bytes": args.kv_cache_mib * 1024 * 1024,
     }
-    engine = VLLMContextASR(args.model, mode="ctc_rag", hot_txt=args.hot_txt,
+    engine = VLLMContextASR(args.model, mode=args.mode, hot_txt=args.hot_txt,
                             max_ctx_hotwords=args.max_ctx_hotwords, rag_workers=args.rag_workers,
                             max_new_tokens=args.max_new_tokens, max_audio_seconds=args.max_audio_seconds,
                             gpu_memory_utilization=args.gpu_memory_utilization,

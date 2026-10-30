@@ -11,10 +11,14 @@ import numpy as np
 from . import ARCHITECTURE, register
 from .requests import (RequestPhonemeCache, RequestVocabularyCache, hotword_target,
                        normalize_options, validate_mode_options)
+from .correction import correct_explicit_aliases, normalize_mixed_identifiers
 from utils.asr_metrics import transcript_text
 
 
 SUPPORTED_VLLM_VERSIONS = ("0.22.1", "0.23.0")
+# Small request vocabularies are scoped by the caller; do not silently drop
+# their words when the CTC transcript deletes letters.
+DIRECT_REQUEST_HOTWORDS = 4
 
 
 def _validate_vllm_version():
@@ -93,9 +97,7 @@ class VLLMContextASR:
             raise ValueError("Use an unquantized, merged checkpoint for the context adapter.")
         if engine_kwargs.get("worker_extension_cls"):
             raise ValueError("Custom worker extensions are not supported by this adapter.")
-        if hot_txt is None:
-            hot_txt = Path(__file__).resolve().parents[1] / "hotword" / "hot.txt"
-        hotword_text = Path(hot_txt).read_text(encoding="utf-8") if mode == "ctc_rag" else ""
+        hotword_text = Path(hot_txt).read_text(encoding="utf-8") if mode == "ctc_rag" and hot_txt else ""
         from vllm import LLM, SamplingParams
         from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
 
@@ -169,6 +171,8 @@ class VLLMContextASR:
                 return {"version": self._hotword_version, "size": len(corrector.hotwords)}
 
     def hotword_info(self):
+        if self.mode != "ctc_rag":
+            raise ValueError("A global vocabulary requires ctc_rag mode.")
         with self._lock:
             return {"version": self._hotword_version, "size": len(self._corrector.hotwords)}
 
@@ -232,10 +236,30 @@ class VLLMContextASR:
                         raise RuntimeError("Decoder returned an unexpected number of transcriptions.")
                 outputs = []
                 for index, item in enumerate(prepared):
-                    text = item["rough"] if self.mode == "ctc" else results[index].outputs[0].text
-                    output = {"mode": self.mode, "text": transcript_text(text)}
+                    completion = None if self.mode == "ctc" else results[index].outputs[0]
+                    text = transcript_text(item["rough"] if completion is None else completion.text)
+                    replacement_count = 0
+                    if self.mode == "ctc_rag" and item.get("corrector") is not None:
+                        text, replacement_count = correct_explicit_aliases(text, item["corrector"], item["hotwords"])
+                        text, normalized_count = normalize_mixed_identifiers(text, item["hotwords"])
+                        replacement_count += normalized_count
+                    output = {"mode": self.mode, "text": text}
+                    finish_reason = getattr(completion, "finish_reason", None)
+                    if finish_reason is not None:
+                        output.update(finish_reason=finish_reason, truncated=finish_reason == "length")
                     if self.mode == "ctc_rag":
-                        output.update(rough=item["rough"], hotwords=item["hotwords"])
+                        retrieved = item.get("retrieved_hotwords", [])
+                        output.update(rough=item["rough"], hotwords=item["hotwords"], retrieved_hotwords=retrieved,
+                                      hotword_stats={"injected": len(item["hotwords"]),
+                                                     "retrieved": len(retrieved),
+                                                     "fallback": len(item["hotwords"]) - len(retrieved),
+                                                     "literal_hits": sum(word.casefold() in text.casefold() for word in item["hotwords"]),
+                                                     "replacements": replacement_count})
+                    elif self.mode == "asr":
+                        output.update(hotwords=item["hotwords"],
+                                      hotword_stats={"injected": len(item["hotwords"]),
+                                                     "literal_hits": sum(word.casefold() in text.casefold() for word in item["hotwords"]),
+                                                     "replacements": 0})
                     outputs.append(output)
                 return outputs
             finally:
@@ -274,6 +298,15 @@ class VLLMContextASR:
                     raise RuntimeError("Retriever returned an unexpected number of results.")
                 for (index, limit), result in zip(members, retrieval):
                     selected[index] = select_hotwords(result, limit)
+                    items[index]["retrieved_hotwords"] = list(selected[index])
+                    if words is not None and len(words) <= DIRECT_REQUEST_HOTWORDS:
+                        # Entries with a contextual blacklist must be selected
+                        # by the retriever, which knows where a match occurs.
+                        targets = (hotword_target(entry) for entry in words if "~~~" not in entry)
+                        selected[index] = list(dict.fromkeys(
+                            selected[index] + [target for target in targets if target]
+                        ))[:limit]
+                    items[index]["corrector"] = corrector
         for index, item in enumerate(items):
             if self.mode == "ctc_rag":
                 hotwords = selected[index]

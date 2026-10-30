@@ -91,6 +91,33 @@ class ServerTest(unittest.TestCase):
             main()
         self.assertNotIn("kv_cache_memory_bytes", engine.call_args.kwargs)
 
+    def test_mode_and_empty_vocabulary_defaults(self):
+        with patch("sys.argv", ["server", "--model", "model", "--mode", "asr"]), \
+             patch("qwen3_asr_vllm.server.VLLMContextASR") as engine, patch("uvicorn.run"):
+            main()
+        self.assertEqual(engine.call_args.kwargs["mode"], "asr")
+        self.assertIsNone(engine.call_args.kwargs["hot_txt"])
+
+    def test_metrics_count_successful_responses(self):
+        self.client.post("/v1/audio/transcriptions", files=self.audio)
+        self.assertEqual(self.client.get("/v1/metrics").json(),
+                         {"requests": 1, "injected": 0, "retrieved": 0, "fallback": 0,
+                          "literal_hits": 0, "replacements": 0, "truncated": 0})
+
+    def test_metrics_collect_hotword_counts_and_truncation(self):
+        response = {"text": "康辉", "hotword_stats": {"injected": 2, "literal_hits": 1, "replacements": 1},
+                    "truncated": True}
+        with patch.object(self.engine, "transcribe_batch", return_value=[response]):
+            self.client.post("/v1/audio/transcriptions", files=self.audio)
+        self.assertEqual(self.client.get("/v1/metrics").json(),
+                         {"requests": 1, "injected": 2, "retrieved": 0, "fallback": 0,
+                          "literal_hits": 1, "replacements": 1, "truncated": 1})
+
+    def test_ctc_mode_rejects_hotword_options(self):
+        self.engine.mode = "ctc"
+        self.assertEqual(self.client.post("/v1/audio/transcriptions", files=self.audio,
+                                          data={"hotwords": "[]"}).status_code, 400)
+
     def test_invalid_kv_cache_size_is_rejected_before_engine_start(self):
         with patch("sys.argv", ["server", "--model", "model", "--hot-txt", "words.txt",
                                 "--kv-cache-mib", "0"]), \

@@ -57,6 +57,7 @@ class UVLauncherTest(unittest.TestCase):
         self.assertEqual(captured['offline'], '1')
         self.assertEqual(captured['env'], str(self.root / '.venv-uv'))
         self.assertIn(str(checkpoint), captured['args'])
-        self.assertIn(str(self.root / 'train_hotwords.txt'), captured['args'])
+        self.assertNotIn('--hot-txt', captured['args'])
+        self.assertEqual(captured['args'][captured['args'].index('--mode') + 1], 'ctc_rag')
         self.assertIn('--kv-cache-mib', captured['args'])
         self.assertIn('1024', captured['args'])
