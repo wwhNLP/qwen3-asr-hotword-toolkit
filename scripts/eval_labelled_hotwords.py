@@ -15,6 +15,7 @@ from qwen3_asr_vllm.runtime import VLLMContextASR, read_audio
 from qwen3_asr_vllm.runtime import select_hotwords
 from hotword import PhonemeCorrector
 from utils.asr_metrics import _PUNCT_RE, cer_counts, transcript_text
+from utils.inference_io import ensure_output_not_input
 
 
 def normalized(text):
@@ -40,17 +41,28 @@ def main():
     required = {'file_name', 'transcript', 'hotwords'}
     if not rows or not required.issubset(rows[0]):
         parser.error(f'CSV must contain {sorted(required)} and at least one record')
+    audio_paths = [args.audio_dir / row['file_name'] for row in rows]
+    model_inputs = [args.model]
+    if args.model.is_dir():
+        model_inputs.extend(path for path in args.model.rglob('*') if path.is_file())
+        if args.output.resolve().is_relative_to(args.model.resolve()):
+            parser.error('output must not be inside the model directory')
+    try:
+        ensure_output_not_input(args.output, [args.labels, *audio_paths, *model_inputs])
+    except ValueError as exc:
+        parser.error(str(exc))
     words = [[word.strip() for word in row['hotwords'].split(';') if word.strip()] for row in rows]
     shared = list(dict.fromkeys(word for sample in words for word in sample))
     # Add two genuine domain terms that do not occur in this sample's labels.
     # These deliberately irrelevant words probe small-request fallback risk.
     distracted = []
     for i, gold in enumerate(words):
-        candidates = shared[(i + 3) % len(shared):] + shared[:(i + 3) % len(shared)]
+        offset = (i + 3) % len(shared) if shared else 0
+        candidates = shared[offset:] + shared[:offset]
         extras = [term for term in candidates if term not in gold
                   and normalized(term) not in normalized(rows[i]['transcript'])][:2]
         distracted.append(gold + extras)
-    audio = [read_audio(args.audio_dir / row['file_name']) for row in rows]
+    audio = [read_audio(path) for path in audio_paths]
     engine = VLLMContextASR(args.model, mode='ctc_rag', max_ctx_hotwords=args.max_hotwords,
                             rag_refiner=args.rag_refiner, max_new_tokens=128, max_model_len=1024,
                             max_num_seqs=args.batch_size, enforce_eager=True,
