@@ -10,10 +10,31 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 rag-native = ["numba>=0.61", "pypinyin>=0.55", "rapidfuzz>=3"]
+server = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "python-multipart>=0.0.18"]
+client = ["httpx>=0.27,<1", "soundfile>=0.12"]
 vllm = [
-    "vllm[audio]==0.22.1",
+    "vllm[audio]==0.23.0",
+    "torch==2.11.0+cu129",
+    "torchaudio==2.11.0+cu129",
+    "torchvision==0.26.0+cu129",
     "transformers==4.57.6",
-    "xgrammar==0.2.5",
+    "nvidia-cudnn-frontend==1.19.1",
+    "xgrammar==0.2.3",
+    "quack-kernels==0.3.3",
+    "pypinyin>=0.55",
+    "rapidfuzz>=3",
+    "numba>=0.61",
+    "soundfile>=0.12",
+    "scipy>=1.10",
+]
+vllm023 = [
+    "vllm[audio]==0.23.0",
+    "torch==2.11.0+cu129",
+    "torchaudio==2.11.0+cu129",
+    "torchvision==0.26.0+cu129",
+    "transformers==4.57.6",
+    "nvidia-cudnn-frontend==1.19.1",
+    "xgrammar==0.2.3",
     "quack-kernels==0.3.3",
     "pypinyin>=0.55",
     "rapidfuzz>=3",
@@ -27,6 +48,8 @@ qwen3_asr_context = "qwen3_asr_vllm:register"
 
 [project.scripts]
 qwen3-asr-context = "qwen3_asr_vllm.cli:main"
+qwen3-asr-server = "qwen3_asr_vllm.server:main"
+qwen3-asr-client = "qwen3_asr_vllm.client:main"
 
 [tool.setuptools.packages.find]
 include = ["qwen3_asr_model*", "qwen3_asr_vllm*", "hotword*", "utils*", "training*"]
@@ -34,3 +57,18 @@ include = ["qwen3_asr_model*", "qwen3_asr_vllm*", "hotword*", "utils*", "trainin
 [tool.setuptools.package-data]
 utils = ["*.json", "*.txt"]
 hotword = ["*.txt"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'"]
+
+[tool.uv.sources]
+vllm = { url = "https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl" }
+torch = { index = "pytorch-cu129" }
+torchaudio = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true

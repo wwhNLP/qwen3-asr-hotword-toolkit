@@ -16,6 +16,12 @@ HAS_NATIVE = (importlib.util.find_spec("numba") is not None
 
 @unittest.skipUnless(HAS_NATIVE, "Numba and pypinyin are required for native refinement")
 class NativeRefinementTest(unittest.TestCase):
+    def test_native_match_rejects_partial_word_at_window_start(self):
+        from hotword.native_refine import match_costs
+
+        result = match_costs(np.zeros((1, 1)), np.array([False]), np.array([True]), 0.9)
+        self.assertEqual(result, [])
+
     def test_generated_sequences_match_python_including_window_offsets(self):
         from hotword.algo_calc import fuzzy_substring_search_constrained
         from hotword.native_refine import NativeRefiner

@@ -20,7 +20,7 @@ This repository builds on that work with:
 - A **two-stage ms-swift workflow** to fine-tune Qwen3-ASR-0.6B for hotword prompts, train a CTC branch, and export the checkpoint for vLLM.
 - **Robustness fixes and tests** for training, inference, and hotword retrieval, plus JSONL batch evaluation with corpus CER.
 
-The vLLM pipeline has been tested with the original author's 1.7B checkpoint. The 0.6B training-to-deployment path has only been smoke-tested for two steps per stage; full training and recognition quality remain unverified.
+The vLLM pipeline has been tested with the original author's 1.7B checkpoint and our fine-tuned 0.6B CTC checkpoint. The 0.6B checkpoint is available on [ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword); its recognition quality has not yet been established by a full evaluation.
 
 ```mermaid
 flowchart LR
@@ -39,32 +39,47 @@ flowchart LR
 - **Three modes:** `asr` for transcription, `ctc` for a rough transcript, and `ctc_rag` for retrieval-assisted transcription.
 - **Shared audio encoding:** the vLLM worker reuses encoded features for CTC and final decoding, avoiding a second encoder pass.
 - **External hotwords:** phoneme-based retrieval selects relevant terms from a UTF-8 text file, one term per line.
+- **Online API:** batch concurrent requests, replace the global vocabulary without restarting, and override it per request. A Python/CLI client is included; see the [server guide](docs/vllm_server.md).
 - **Training and evaluation:** prepare AISHELL-1 data, fine-tune a 0.6B model with ms-swift, train a CTC branch, and evaluate JSONL batches with corpus CER.
 
 ## 🚀 Quick start
 
-Use a separate Python 3.10+ GPU environment. The vLLM adapter targets **vLLM 0.22.1** and **Transformers 4.57.6**; install CUDA-compatible vLLM and PyTorch builds for your system.
+The locked deployment uses **Python 3.12, vLLM 0.23.0 and CUDA 12.9** on Linux x86-64. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use an NVIDIA GPU with a compatible driver.
+
+1. Clone the repository and download the [fine-tuned Qwen3-ASR-0.6B CTC model](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword) into `checkpoint/`:
 
 ```bash
-git clone https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
+git clone --branch dev https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
 cd qwen3-asr-hotword-toolkit
-python -m pip install -e '.[vllm]'
+uvx --from modelscope==1.37.0 modelscope download \
+  --model wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword \
+  --endpoint https://www.modelscope.ai --local_dir ./checkpoint
 ```
 
-Download a checkpoint with a trained CTC branch, such as the original author's [1.7B hotword model](https://huggingface.co/habagou/qwen3-asr-hotword-1.7B-ctc):
+2. Install the locked runtime, server, and client dependencies:
 
 ```bash
-hf download habagou/qwen3-asr-hotword-1.7B-ctc \
-  --local-dir ./ckpt/qwen3-asr-hotword-1.7B-ctc
-
-CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
-  --model ./ckpt/qwen3-asr-hotword-1.7B-ctc \
-  --audio /path/to/audio.wav \
-  --mode ctc_rag --hot-txt /path/to/hotwords.txt \
-  --verify-encoder-reuse
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
 ```
 
-`ctc` and `ctc_rag` require a checkpoint with a CTC branch. The included `hotword/hot.txt` is an example; replace it with a list relevant to your audio. `--verify-encoder-reuse` checks that each audio segment is encoded once.
+3. Start the service:
+
+```bash
+./scripts/serve.sh
+```
+
+4. In another terminal, transcribe an audio file:
+
+```bash
+.venv-uv/bin/python -m qwen3_asr_vllm.client transcribe \
+  --audio /path/to/audio.wav --hotword "广州" --hotword "康辉"
+```
+
+The checkpoint includes the trained CTC branch; no training is needed to run it. The server defaults to GPU 0 and port 8900, with an empty global vocabulary. Edit `GPU_ID`, `HOTWORD_FILE` and memory settings in `scripts/serve.sh` as needed, or pass hotwords with each request. `uv.lock` pins the vLLM and PyTorch wheels; see the [vLLM 0.23 setup guide](docs/vllm_023.md) for offline installation.
+
+The online server supports `--mode asr`, `--mode ctc`, and `--mode ctc_rag`. Uppercase Latin acronyms such as `GPU` also get a common Chinese letter-name reading for retrieval; add explicit aliases such as `Claude|克劳德` for other pronunciations. Selected, unambiguous explicit aliases are replaced literally in the final transcript; choose aliases carefully, since an alias may also occur with another meaning. Automatic acronym readings and fuzzy phonetic matches are retrieval-only. Blacklists suppress replacements conservatively.
+
+Responses report the number of injected words, literal hits and alias replacements. `/v1/metrics` aggregates those counts, successful requests and length-truncated results for the current server process. A literal hit only means that the word appears in the output; it does not establish correctness. For long audio, the client seeks a nearby quiet interval before each maximum-length boundary and reports `truncated` if any segment reaches the decoder limit. Continuous speech still falls back to fixed boundaries.
 
 For a JSONL batch, each record needs one audio path. An optional assistant message supplies the reference for CER. Individual records can provide a vocabulary and inference limits:
 
@@ -74,12 +89,12 @@ For a JSONL batch, each record needs one audio path. An optional assistant messa
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
-  --model ./ckpt/qwen3-asr-hotword-1.7B-ctc \
+  --model ./checkpoint \
   --test-json /path/to/test.jsonl --mode ctc_rag \
   --hot-txt /path/to/hotwords.txt --batch-size 8 --out-json results.jsonl
 ```
 
-In `ctc_rag` mode, request `hotwords` replace the default `--hot-txt` vocabulary for that audio; retrieval selects up to `max_ctx_hotwords` matches. Omit the field or use `null` for the default vocabulary, and use `[]` to disable hotwords for that audio. The same fields can be supplied from Python:
+In `ctc_rag` mode, request `hotwords` replace the default `--hot-txt` vocabulary for that audio; retrieval selects up to `max_ctx_hotwords` matches. For a request containing at most four entries, remaining slots are filled with explicitly supplied words without blacklists, even when CTC misses them. Use a focused list to avoid irrelevant prompts. Omit the field or use `null` for the default vocabulary, and use `[]` to disable hotwords for that audio. The same fields can be supplied from Python:
 
 ```python
 from qwen3_asr_vllm.runtime import VLLMContextASR
@@ -131,7 +146,7 @@ Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), i
 
 Weighted refinement uses Numba when available (`--rag-refiner auto`, the default). Vocabulary loading prepares the compiled kernel before inference. Select `python` or `numba` explicitly for comparisons. The vLLM extra includes Numba; standalone hotword users can install `.[rag-native]`.
 
-See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The supported inference version remains **vLLM 0.22.1**.
+See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The locked deployment targets **vLLM 0.23.0**; 0.22.1 results are historical.
 
 ## 🙏 Credits and license
 

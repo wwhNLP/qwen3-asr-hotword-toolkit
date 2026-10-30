@@ -11,7 +11,21 @@ import numpy as np
 from . import ARCHITECTURE, register
 from .requests import (RequestPhonemeCache, RequestVocabularyCache, hotword_target,
                        normalize_options, validate_mode_options)
+from .correction import correct_explicit_aliases, normalize_mixed_identifiers
 from utils.asr_metrics import transcript_text
+
+
+SUPPORTED_VLLM_VERSIONS = ("0.22.1", "0.23.0")
+# Small request vocabularies are scoped by the caller; do not silently drop
+# their words when the CTC transcript deletes letters.
+DIRECT_REQUEST_HOTWORDS = 4
+
+
+def _validate_vllm_version():
+    installed = version("vllm")
+    if installed.split("+", 1)[0] not in SUPPORTED_VLLM_VERSIONS:
+        supported = ", ".join(SUPPORTED_VLLM_VERSIONS)
+        raise RuntimeError(f"This adapter requires vLLM {supported}; found {installed}.")
 
 
 def select_hotwords(result, max_hotwords):
@@ -26,7 +40,8 @@ def read_audio(path):
     from math import gcd
     from scipy.signal import resample_poly
 
-    waveform, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    source = path if hasattr(path, "read") else str(path)
+    waveform, sample_rate = sf.read(source, dtype="float32", always_2d=True)
     waveform = waveform.mean(axis=1)
     if sample_rate != 16000:
         divisor = gcd(sample_rate, 16000)
@@ -39,7 +54,7 @@ class VLLMContextASR:
 
     Calls are serialized because preparation RPC and generation share one
     engine. transcribe_batch batches encoding, CTC and final decoding.
-    This adapter targets vLLM 0.22.1 and an unquantized, merged checkpoint.
+    This adapter targets vLLM 0.22.1/0.23.0 and an unquantized, merged checkpoint.
     """
 
     def __init__(
@@ -74,8 +89,7 @@ class VLLMContextASR:
         request_cache = RequestVocabularyCache(max_entries=request_cache_size)
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
-        if version("vllm").split("+")[0] != "0.22.1":
-            raise RuntimeError("This adapter requires vllm==0.22.1 (CUDA build suffixes are supported).")
+        _validate_vllm_version()
         for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size"):
             if engine_kwargs.get(name, 1) != 1:
                 raise ValueError("The context adapter currently supports one vLLM worker/GPU.")
@@ -83,9 +97,7 @@ class VLLMContextASR:
             raise ValueError("Use an unquantized, merged checkpoint for the context adapter.")
         if engine_kwargs.get("worker_extension_cls"):
             raise ValueError("Custom worker extensions are not supported by this adapter.")
-        if hot_txt is None:
-            hot_txt = Path(__file__).resolve().parents[1] / "hotword" / "hot.txt"
-        hotword_text = Path(hot_txt).read_text(encoding="utf-8") if mode == "ctc_rag" else ""
+        hotword_text = Path(hot_txt).read_text(encoding="utf-8") if mode == "ctc_rag" and hot_txt else ""
         from vllm import LLM, SamplingParams
         from vllm.transformers_utils.processors.qwen3_asr import Qwen3ASRProcessor
 
@@ -126,6 +138,8 @@ class VLLMContextASR:
             stop_token_ids=[151643, 151645],
         )
         self._lock = Lock()
+        self._hotword_update_lock = Lock()
+        self._hotword_version = 1
         self.llm.collective_rpc(
             "context_configure",
             args=(
@@ -137,6 +151,30 @@ class VLLMContextASR:
                 },
             )
         )
+
+    def update_hotwords(self, hotword_text):
+        """Build a replacement vocabulary and swap it between inference calls."""
+        if self.mode != "ctc_rag":
+            raise ValueError("A global vocabulary requires ctc_rag mode.")
+        if not isinstance(hotword_text, str):
+            raise ValueError("hotword_text must be a string.")
+        from hotword import PhonemeCorrector
+
+        # Serialize updates, but leave inference free to use the old corrector
+        # while the replacement's phoneme index is constructed.
+        with self._hotword_update_lock:
+            corrector = PhonemeCorrector(threshold=self.rag_threshold, refiner=self.rag_refiner)
+            corrector.update_hotwords(hotword_text)
+            with self._lock:
+                self._corrector = corrector
+                self._hotword_version += 1
+                return {"version": self._hotword_version, "size": len(corrector.hotwords)}
+
+    def hotword_info(self):
+        if self.mode != "ctc_rag":
+            raise ValueError("A global vocabulary requires ctc_rag mode.")
+        with self._lock:
+            return {"version": self._hotword_version, "size": len(self._corrector.hotwords)}
 
     def transcribe(self, audio, *, hotwords=None, max_ctx_hotwords=None, max_new_tokens=None):
         options = {"max_ctx_hotwords": max_ctx_hotwords, "max_new_tokens": max_new_tokens}
@@ -198,10 +236,32 @@ class VLLMContextASR:
                         raise RuntimeError("Decoder returned an unexpected number of transcriptions.")
                 outputs = []
                 for index, item in enumerate(prepared):
-                    text = item["rough"] if self.mode == "ctc" else results[index].outputs[0].text
-                    output = {"mode": self.mode, "text": transcript_text(text)}
+                    completion = None if self.mode == "ctc" else results[index].outputs[0]
+                    text = transcript_text(item["rough"] if completion is None else completion.text)
+                    replacement_count = 0
+                    if self.mode == "ctc_rag" and item.get("corrector") is not None:
+                        text, replacement_count = correct_explicit_aliases(text, item["corrector"], item["hotwords"])
+                        text, normalized_count = normalize_mixed_identifiers(
+                            text, item["hotwords"], blacklists=getattr(item["corrector"], "blacklists", {})
+                        )
+                        replacement_count += normalized_count
+                    output = {"mode": self.mode, "text": text}
+                    finish_reason = getattr(completion, "finish_reason", None)
+                    if finish_reason is not None:
+                        output.update(finish_reason=finish_reason, truncated=finish_reason == "length")
                     if self.mode == "ctc_rag":
-                        output.update(rough=item["rough"], hotwords=item["hotwords"])
+                        retrieved = item.get("retrieved_hotwords", [])
+                        output.update(rough=item["rough"], hotwords=item["hotwords"], retrieved_hotwords=retrieved,
+                                      hotword_stats={"injected": len(item["hotwords"]),
+                                                     "retrieved": len(retrieved),
+                                                     "fallback": len(item["hotwords"]) - len(retrieved),
+                                                     "literal_hits": sum(word.casefold() in text.casefold() for word in item["hotwords"]),
+                                                     "replacements": replacement_count})
+                    elif self.mode == "asr":
+                        output.update(hotwords=item["hotwords"],
+                                      hotword_stats={"injected": len(item["hotwords"]),
+                                                     "literal_hits": sum(word.casefold() in text.casefold() for word in item["hotwords"]),
+                                                     "replacements": 0})
                     outputs.append(output)
                 return outputs
             finally:
@@ -240,6 +300,15 @@ class VLLMContextASR:
                     raise RuntimeError("Retriever returned an unexpected number of results.")
                 for (index, limit), result in zip(members, retrieval):
                     selected[index] = select_hotwords(result, limit)
+                    items[index]["retrieved_hotwords"] = list(selected[index])
+                    if words is not None and len(words) <= DIRECT_REQUEST_HOTWORDS:
+                        # Entries with a contextual blacklist must be selected
+                        # by the retriever, which knows where a match occurs.
+                        targets = (hotword_target(entry) for entry in words if "~~~" not in entry)
+                        selected[index] = list(dict.fromkeys(
+                            selected[index] + [target for target in targets if target]
+                        ))[:limit]
+                    items[index]["corrector"] = corrector
         for index, item in enumerate(items):
             if self.mode == "ctc_rag":
                 hotwords = selected[index]

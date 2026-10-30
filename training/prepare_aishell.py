@@ -163,13 +163,13 @@ def sample_hotwords(row, lexicon, matcher, seed=42, empty_ratio=0.2, negative_ra
     selected = positives[:max_positive]
     negatives = []
     # Bounded sampling avoids scanning the entire lexicon for every utterance.
-    for index in rng.sample(range(len(lexicon)), min(len(lexicon), max(64, distractors * 8))):
-        word = lexicon[index]
-        if word not in row["text"]:
-            negatives.append(word)
-        if len(negatives) >= distractors:
-            break
     if distractors:
+        for index in rng.sample(range(len(lexicon)), min(len(lexicon), max(64, distractors * 8))):
+            word = lexicon[index]
+            if word not in row["text"]:
+                negatives.append(word)
+            if len(negatives) >= distractors:
+                break
         selected.extend(negatives)
     rng.shuffle(selected)
     return selected
@@ -215,7 +215,10 @@ def prepare(args):
     if args.seaco_root:
         for split in ("dev", "test"):
             source = Path(args.seaco_root) / "data" / split
-            ids = {line.split()[0] for line in (source / "uttid").read_text().splitlines() if line.strip()}
+            ids = {line.split()[0] for line in (source / "uttid").read_text(encoding="utf-8").splitlines()
+                   if line.strip()}
+            if not ids:
+                raise ValueError(f"Empty {split} SeACo ID list: {source / 'uttid'}")
             rows = [row for row in splits[split] if row["uttid"] in ids]
             missing = ids - {row["uttid"] for row in rows}
             if missing:
