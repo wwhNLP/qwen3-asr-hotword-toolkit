@@ -192,7 +192,7 @@ def fuzzy_substring_search_constrained(hw_info: List[Tuple], input_info: List[Tu
 
     # 初始化第一行：允许从任何词起始边界开始匹配
     for j in range(m + 1):
-        if j == 0 or (j < m and input_starts[j]):
+        if j < m and input_starts[j]:
             previous[j] = 0.0
             previous_starts[j] = j
 

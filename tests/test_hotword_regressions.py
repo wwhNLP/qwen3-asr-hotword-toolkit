@@ -169,6 +169,13 @@ class HotwordRetrievalTest(unittest.TestCase):
             with self.subTest(hotword=hotword, text=text, threshold=threshold):
                 self.assertEqual(fuzzy_substring_search_constrained(hotword, text, threshold), expected)
 
+    def test_match_cannot_start_inside_a_word_at_window_boundary(self):
+        from hotword.algo_calc import fuzzy_substring_search_constrained
+
+        hotword = [("b", "en", True, True, False)]
+        partial_word = [("b", "en", False, True, False)]
+        self.assertEqual(fuzzy_substring_search_constrained(hotword, partial_word, 0.9), [])
+
     def test_blacklisted_occurrence_is_excluded_from_prompt_candidates(self):
         from hotword import PhonemeCorrector
 

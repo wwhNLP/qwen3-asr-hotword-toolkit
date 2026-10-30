@@ -21,7 +21,7 @@ def match_costs(costs, word_starts, word_ends, threshold):
     previous_starts = np.zeros(m + 1, dtype=np.int64)
     current_starts = np.zeros(m + 1, dtype=np.int64)
     for j in range(m + 1):
-        if j == 0 or (j < m and word_starts[j]):
+        if j < m and word_starts[j]:
             previous[j] = 0.0
             previous_starts[j] = j
 
