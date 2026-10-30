@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--max-ctx-hotwords", type=int, default=10)
     parser.add_argument("--rag-workers", type=int, default=4)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--kv-cache-mib", type=int, default=None,
+                        help="Set KV cache size in MiB; bypasses automatic cache sizing")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-audio-seconds", type=int, default=30)
@@ -129,12 +131,18 @@ def main():
         parser.error("Upload limits must be positive.")
     if args.max_batch_size < 1 or args.max_batch_wait_ms < 0 or args.max_queue_size < 1:
         parser.error("Batch and queue sizes must be positive; batch wait must be nonnegative.")
+    if args.kv_cache_mib is not None and args.kv_cache_mib < 1:
+        parser.error("--kv-cache-mib must be positive.")
 
+    cache_options = {} if args.kv_cache_mib is None else {
+        "kv_cache_memory_bytes": args.kv_cache_mib * 1024 * 1024,
+    }
     engine = VLLMContextASR(args.model, mode="ctc_rag", hot_txt=args.hot_txt,
                             max_ctx_hotwords=args.max_ctx_hotwords, rag_workers=args.rag_workers,
                             max_new_tokens=args.max_new_tokens, max_audio_seconds=args.max_audio_seconds,
                             gpu_memory_utilization=args.gpu_memory_utilization,
-                            max_model_len=args.max_model_len, max_num_seqs=args.max_batch_size)
+                            max_model_len=args.max_model_len, max_num_seqs=args.max_batch_size,
+                            **cache_options)
     app = create_app(engine, max_audio_bytes=args.max_audio_mib * 1024 * 1024,
                      max_vocabulary_bytes=args.max_vocabulary_mib * 1024 * 1024,
                      max_batch_size=args.max_batch_size,

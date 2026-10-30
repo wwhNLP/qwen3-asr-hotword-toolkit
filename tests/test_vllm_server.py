@@ -9,7 +9,7 @@ import soundfile as sf
 from fastapi.testclient import TestClient
 
 from qwen3_asr_vllm.runtime import VLLMContextASR
-from qwen3_asr_vllm.server import create_app
+from qwen3_asr_vllm.server import create_app, main
 
 
 def wav_bytes(seconds=0.1):
@@ -77,6 +77,28 @@ class ServerTest(unittest.TestCase):
         with TestClient(create_app(self.engine, max_audio_bytes=100000)) as duration_client:
             self.assertEqual(duration_client.post("/v1/audio/transcriptions", files={
                 "file": ("long.wav", wav_bytes(1.1), "audio/wav")}).status_code, 400)
+
+    def test_explicit_kv_cache_size_is_passed_to_engine(self):
+        with patch("sys.argv", ["server", "--model", "model", "--hot-txt", "words.txt",
+                                "--kv-cache-mib", "1024"]), \
+             patch("qwen3_asr_vllm.server.VLLMContextASR") as engine, patch("uvicorn.run"):
+            main()
+        self.assertEqual(engine.call_args.kwargs["kv_cache_memory_bytes"], 1024 * 1024 * 1024)
+
+    def test_automatic_kv_cache_sizing_remains_default(self):
+        with patch("sys.argv", ["server", "--model", "model", "--hot-txt", "words.txt"]), \
+             patch("qwen3_asr_vllm.server.VLLMContextASR") as engine, patch("uvicorn.run"):
+            main()
+        self.assertNotIn("kv_cache_memory_bytes", engine.call_args.kwargs)
+
+    def test_invalid_kv_cache_size_is_rejected_before_engine_start(self):
+        with patch("sys.argv", ["server", "--model", "model", "--hot-txt", "words.txt",
+                                "--kv-cache-mib", "0"]), \
+             patch("sys.stderr", new_callable=io.StringIO), \
+             patch("qwen3_asr_vllm.server.VLLMContextASR") as engine:
+            with self.assertRaises(SystemExit):
+                main()
+        engine.assert_not_called()
 
 
 class HotwordUpdateTest(unittest.TestCase):

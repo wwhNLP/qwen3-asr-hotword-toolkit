@@ -37,6 +37,33 @@ This endpoint does not provide authentication. If it must be reached
 from another machine, use `--host 0.0.0.0` only behind appropriate access
 control and request-size limits at a reverse proxy.
 
+To cap the KV cache explicitly, add `--kv-cache-mib 1024` to the server
+command. This sets the KV cache size, not total GPU memory. vLLM uses that
+value instead of automatic KV sizing from `--gpu-memory-utilization`; model
+weights, activations, CUDA graphs, and other allocations remain additional.
+An undersized KV cache can reduce throughput or prevent startup for a long
+context. See the [vLLM cache configuration](https://docs.vllm.ai/en/v0.23.0/api/vllm/config/cache/).
+In vLLM 0.23, `--gpu-memory-utilization` still participates in the startup
+free-memory check even when KV cache size is set explicitly; it is not a
+hard limit on total allocation in that mode.
+
+On a shared A800, with the local 0.6B checkpoint, batch size 8, maximum model
+length 1024, 100 hotwords and `gpu_memory_utilization=0.12`, setting the KV
+cache to 1024 MiB reduced the process's sampled GPU-memory peak from
+10,084 to 5,002 MiB. Startup memory dropped from 8,826 to 3,840 MiB. These
+are sampled process measurements, not guaranteed maximums. With fixed
+`PYTHONHASHSEED=0`, three repeated runs over eight AISHELL clips and eight
+30-second meeting clips returned identical final transcripts, rough transcripts
+and selected hotwords under both configurations. A prior run without a fixed
+hash seed had differing results on the meeting clips. The runs do not establish
+accuracy equivalence for other audio or loads.
+
+The same 1024 MiB KV configuration also passed those tests with
+`--gpu-memory-utilization 0.08`; the sampled peak was still 5,002 MiB. This
+lower ratio reduces the startup free-memory requirement on an 80 GiB GPU from
+about 9.6 to 6.4 GiB, but is not a guarantee that 6.4 GiB is sufficient for
+every workload. Benchmark with your own maximum audio length and concurrency.
+
 ## Transcribe
 
 Upload an audio file supported by libsndfile. It is converted to mono 16 kHz;
