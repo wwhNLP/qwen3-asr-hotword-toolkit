@@ -20,7 +20,7 @@ This repository builds on that work with:
 - A **two-stage ms-swift workflow** to fine-tune Qwen3-ASR-0.6B for hotword prompts, train a CTC branch, and export the checkpoint for vLLM.
 - **Robustness fixes and tests** for training, inference, and hotword retrieval, plus JSONL batch evaluation with corpus CER.
 
-The vLLM pipeline has been tested with the original author's 1.7B checkpoint. The 0.6B training-to-deployment path has only been smoke-tested for two steps per stage; full training and recognition quality remain unverified.
+The vLLM pipeline has been tested with the original author's 1.7B checkpoint and a locally trained 0.6B CTC checkpoint. The 0.6B recognition quality has not yet been established by a full evaluation.
 
 ```mermaid
 flowchart LR
@@ -39,17 +39,20 @@ flowchart LR
 - **Three modes:** `asr` for transcription, `ctc` for a rough transcript, and `ctc_rag` for retrieval-assisted transcription.
 - **Shared audio encoding:** the vLLM worker reuses encoded features for CTC and final decoding, avoiding a second encoder pass.
 - **External hotwords:** phoneme-based retrieval selects relevant terms from a UTF-8 text file, one term per line.
+- **Online API:** batch concurrent requests, replace the global vocabulary without restarting, and override it per request. A Python/CLI client is included; see the [server guide](docs/vllm_server.md).
 - **Training and evaluation:** prepare AISHELL-1 data, fine-tune a 0.6B model with ms-swift, train a CTC branch, and evaluate JSONL batches with corpus CER.
 
 ## 🚀 Quick start
 
-Use a separate Python 3.10+ GPU environment. The vLLM adapter targets **vLLM 0.22.1** and **Transformers 4.57.6**; install CUDA-compatible vLLM and PyTorch builds for your system.
+Use a separate Python 3.10+ GPU environment. The adapter supports **vLLM 0.22.1 or 0.23.0** with **Transformers 4.57.6**. Select CUDA-compatible vLLM and PyTorch builds for your system.
 
 ```bash
 git clone https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
 cd qwen3-asr-hotword-toolkit
 python -m pip install -e '.[vllm]'
 ```
+
+The `vllm` extra installs 0.22.1. For 0.23.0, use `.[vllm023]` in a separate environment; follow the [0.23 setup and validation guide](docs/vllm_023.md) to select the correct CUDA wheel.
 
 Download a checkpoint with a trained CTC branch, such as the original author's [1.7B hotword model](https://huggingface.co/habagou/qwen3-asr-hotword-1.7B-ctc):
 
@@ -131,7 +134,7 @@ Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), i
 
 Weighted refinement uses Numba when available (`--rag-refiner auto`, the default). Vocabulary loading prepares the compiled kernel before inference. Select `python` or `numba` explicitly for comparisons. The vLLM extra includes Numba; standalone hotword users can install `.[rag-native]`.
 
-See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The supported inference version remains **vLLM 0.22.1**.
+See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. Supported inference releases are **vLLM 0.22.1 and 0.23.0**.
 
 ## 🙏 Credits and license
 
