@@ -61,3 +61,21 @@ class UVLauncherTest(unittest.TestCase):
         self.assertEqual(captured['args'][captured['args'].index('--mode') + 1], 'ctc_rag')
         self.assertIn('--kv-cache-mib', captured['args'])
         self.assertIn('1024', captured['args'])
+
+    def test_relative_hotword_file_is_resolved_from_project(self):
+        script = self.root / 'scripts/serve.sh'
+        script.write_text(script.read_text().replace('HOTWORD_FILE=""', 'HOTWORD_FILE="train_hotwords.txt"'))
+        checkpoint = self.root / 'checkpoint'
+        checkpoint.mkdir()
+        for name in ('config.json', 'preprocessor_config.json', 'tokenizer.json', 'model.safetensors'):
+            (checkpoint / name).write_text('{}')
+        hotwords = self.root / 'train_hotwords.txt'
+        hotwords.write_text('广州\n')
+        python = self.root / '.venv-uv/bin/python'
+        python.parent.mkdir(parents=True)
+        python.write_text('#!/bin/sh\nexit 0\n')
+        python.chmod(0o755)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(self.capture.read_text())['args']
+        self.assertEqual(args[args.index('--hot-txt') + 1], str(hotwords))

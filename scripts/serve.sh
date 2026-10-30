@@ -19,6 +19,10 @@ MAX_NEW_TOKENS=96
 MAX_BATCH_SIZE=8
 MAX_BATCH_WAIT_MS=20
 
+if [[ -n "$HOTWORD_FILE" && "$HOTWORD_FILE" != /* ]]; then
+  HOTWORD_FILE="$PROJECT_DIR/$HOTWORD_FILE"
+fi
+
 for file in config.json preprocessor_config.json tokenizer.json; do
   if [[ ! -f "$MODEL_DIR/$file" ]]; then
     printf 'Model file not found: %s\n' "$MODEL_DIR/$file" >&2
