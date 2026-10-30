@@ -24,7 +24,7 @@ python -m qwen3_asr_vllm.server \
 ```
 
 Wait for the server startup message. By default it listens on
-`127.0.0.1:8000`; `/health` checks readiness and `/docs` shows the API schema.
+`127.0.0.1:8900`; `/health` checks readiness and `/docs` shows the API schema.
 The process hosts a single engine on one GPU. Concurrent requests are queued
 and grouped into batches of up to `--max-batch-size`. The first request waits
 up to `--max-batch-wait-ms` for others; a busy engine can add queueing time.
@@ -44,7 +44,7 @@ the default duration limit is 30 seconds (`--max-audio-seconds`). The response
 contains `text`, `rough`, and the retrieved `hotwords`.
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/audio/transcriptions \
+curl -s http://127.0.0.1:8900/v1/audio/transcriptions \
   -F 'file=@/path/to/audio.wav'
 ```
 
@@ -52,7 +52,7 @@ To give a request its own vocabulary, submit a JSON list as the multipart
 form field `hotwords`:
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/audio/transcriptions \
+curl -s http://127.0.0.1:8900/v1/audio/transcriptions \
   -F 'file=@/path/to/audio.wav' \
   -F 'hotwords=["广州市","康辉"]' \
   -F 'max_ctx_hotwords=100'
@@ -65,7 +65,19 @@ so it does not guarantee every supplied word enters the prompt or transcript.
 `max_ctx_hotwords` is an upper bound; `max_new_tokens` can also be set per
 request. The global and other requests' vocabularies are unchanged.
 
-The Python and command-line client supports the same options:
+Run the client without arguments to transcribe the configured default audio:
+
+```bash
+python qwen3_asr_vllm/client.py
+```
+
+Set `DEFAULT_URL`, `DEFAULT_AUDIO` and `DEFAULT_HOTWORDS` near the top of the
+client file. `None` uses the server vocabulary; a list supplies request
+hotwords. Audio longer than 30 seconds is divided into 30-second segments,
+with up to four requests in flight, and results are joined in order. Segment
+boundaries can affect recognition; the returned `segments` include timestamps.
+
+The Python and command-line client also supports explicit options:
 
 ```bash
 python -m qwen3_asr_vllm.client transcribe --audio /path/to/audio.wav \
@@ -76,7 +88,7 @@ python -m qwen3_asr_vllm.client update-hotwords --file /path/to/new-hotwords.txt
 python -m qwen3_asr_vllm.client batching-info
 ```
 
-Use `--url http://host:8000` before the subcommand for a remote server. In
+Use `--url http://host:8900` before the subcommand for a remote server. In
 Python, create an `ASRClient` and call `transcribe(path, hotwords=[...])`;
 `transcribe_many(paths, concurrency=8)` submits concurrent requests and returns
 results in input order. It applies one shared request vocabulary to those
@@ -98,10 +110,10 @@ Send UTF-8 text, one entry per line. Alias and blacklist syntax is supported,
 for example `康辉|康灰~~~央视`.
 
 ```bash
-curl -s -X PUT http://127.0.0.1:8000/v1/hotwords \
+curl -s -X PUT http://127.0.0.1:8900/v1/hotwords \
   -H 'Content-Type: text/plain; charset=utf-8' \
   --data-binary @/path/to/new-hotwords.txt
-curl -s http://127.0.0.1:8000/v1/hotwords
+curl -s http://127.0.0.1:8900/v1/hotwords
 ```
 
 The response contains the active `version` and indexed `size`. Index creation

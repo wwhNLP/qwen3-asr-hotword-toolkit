@@ -1,12 +1,15 @@
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import numpy as np
+import soundfile as sf
 
-from qwen3_asr_vllm.client import ASRClient
+from qwen3_asr_vllm.client import ASRClient, DEFAULT_AUDIO, DEFAULT_URL, main
 
 
 class ClientTest(unittest.TestCase):
@@ -54,3 +57,35 @@ class ClientTest(unittest.TestCase):
         self.assertEqual([item["audio"] for item in result], ["a", "b", "c"])
         with self.assertRaises(ValueError):
             self.client.transcribe_many(["a"], concurrency=0)
+
+    def test_long_audio_splits_and_joins_in_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "long.wav"
+            samples = np.concatenate([np.full(1000, .1), np.full(1000, .2), np.full(500, .3)])
+            sf.write(path, samples, 1000)
+
+            def recognize(name, stream, **options):
+                waveform, _ = sf.read(stream)
+                index = round(waveform[0] * 10)
+                self.assertEqual(options["hotwords"], ["词"])
+                return {"mode": "ctc_rag", "text": str(index), "rough": str(index), "hotwords": ["词"]}
+
+            progress = []
+            with patch.object(self.client, "_transcribe_stream", side_effect=recognize):
+                result = self.client.transcribe_audio(path, chunk_seconds=1, concurrency=2,
+                                                       hotwords=["词"], on_progress=lambda *x: progress.append(x))
+            self.assertEqual(result["text"], "123")
+            self.assertEqual([(s["start"], s["end"]) for s in result["segments"]],
+                             [(0, 1), (1, 2), (2, 2.5)])
+            self.assertEqual(result["hotwords"], ["词"])
+            self.assertEqual(progress, [(2, 3), (3, 3)])
+
+    def test_no_arguments_uses_configured_defaults(self):
+        with patch("sys.argv", ["client.py"]), patch("sys.stdout", new_callable=io.StringIO), \
+             patch("qwen3_asr_vllm.client.ASRClient") as client_class:
+            client = client_class.return_value.__enter__.return_value
+            client.transcribe_audio.return_value = {"text": "结果"}
+            main()
+        client_class.assert_called_once_with(DEFAULT_URL, timeout=120, trust_env=False)
+        self.assertEqual(client.transcribe_audio.call_args.args[0], DEFAULT_AUDIO)
+        self.assertIsNone(client.transcribe_audio.call_args.kwargs["hotwords"])
