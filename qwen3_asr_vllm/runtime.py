@@ -241,7 +241,9 @@ class VLLMContextASR:
                     replacement_count = 0
                     if self.mode == "ctc_rag" and item.get("corrector") is not None:
                         text, replacement_count = correct_explicit_aliases(text, item["corrector"], item["hotwords"])
-                        text, normalized_count = normalize_mixed_identifiers(text, item["hotwords"])
+                        text, normalized_count = normalize_mixed_identifiers(
+                            text, item["hotwords"], blacklists=getattr(item["corrector"], "blacklists", {})
+                        )
                         replacement_count += normalized_count
                     output = {"mode": self.mode, "text": text}
                     finish_reason = getattr(completion, "finish_reason", None)

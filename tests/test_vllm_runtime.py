@@ -30,6 +30,11 @@ class HotwordSelectionTest(unittest.TestCase):
         self.assertEqual(corrected, "SpO2和FiO2，XSpO二保持，FiO三保持")
         self.assertEqual(count, 2)
 
+    def test_mixed_identifier_preserves_longer_digit_sequences(self):
+        text = "SpO二三，SpO二 三，SpO二 is low，AB一零零"
+        self.assertEqual(normalize_mixed_identifiers(text, ["SpO2", "AB10"]),
+                         ("SpO二三，SpO二 三，SpO2 is low，AB一零零", 1))
+
     def test_only_explicit_unambiguous_aliases_are_replaced(self):
         corrector = SimpleNamespace(explicit_aliases={"康辉": ("康灰",), "公司": (),
                                                        "Claude": ("cloud",)},
@@ -162,6 +167,19 @@ class VLLMRuntimeTest(unittest.TestCase):
         self.assertEqual(result["rough"], "粗转写1")
         self.assertEqual(result["hotword_stats"], {"injected": 1, "retrieved": 1, "fallback": 0,
                                                    "literal_hits": 1, "replacements": 1})
+
+    def test_mixed_identifier_correction_honors_blacklist(self):
+        runtime, _, _ = self.make_runtime("ctc_rag")
+        runtime._corrector.explicit_aliases = {}
+        runtime._corrector.blacklists = {"SpO2": {"校准"}}
+        runtime._corrector.correct.return_value = SimpleNamespace(matches=[], similars=[("SpO2", "SpO2", 1.0)])
+        runtime.llm.generate.side_effect = None
+        text = "校准SpO二，其他资料一二三四五六七八九十，然后SpO2正常"
+        runtime.llm.generate.return_value = [SimpleNamespace(outputs=[SimpleNamespace(text=text)])]
+        result = runtime.transcribe(np.zeros(1600))
+        self.assertEqual(result["hotwords"], ["SpO2"])
+        self.assertEqual(result["text"], text)
+        self.assertEqual(result["hotword_stats"]["replacements"], 0)
 
     def test_asr_prompt_uses_targets_not_aliases_or_blacklists(self):
         runtime, _, _ = self.make_runtime("asr")

@@ -7,14 +7,19 @@ _DIGIT_VARIANTS = {"0": "0零", "1": "1一", "2": "2二", "3": "3三", "4": "4�
                    "5": "5五", "6": "6六", "7": "7七", "8": "8八", "9": "9九"}
 
 
-def normalize_mixed_identifiers(text, selected):
+def normalize_mixed_identifiers(text, selected, *, blacklists=None):
     """Normalize exact alphanumeric identifiers containing spoken digits."""
     count = 0
+    blacklists = blacklists or {}
     for target in sorted(set(selected), key=len, reverse=True):
         if not re.fullmatch(r"[A-Za-z]{2,}[0-9]+", target):
             continue
+        if any(word in text for word in blacklists.get(target, ())):
+            continue
         parts = [f"[{_DIGIT_VARIANTS[c]}]" if c in _DIGIT_VARIANTS else re.escape(c) for c in target]
-        pattern = re.compile(r"(?<![A-Za-z0-9])" + r"\s*".join(parts) + r"(?![A-Za-z0-9])", re.IGNORECASE)
+        pattern = re.compile(r"(?<![A-Za-z0-9])" + r"\s*".join(parts)
+                             + r"(?![A-Za-z0-9零一二三四五六七八九])(?!\s+[0-9零一二三四五六七八九])",
+                             re.IGNORECASE)
 
         def replace(match):
             nonlocal count
