@@ -20,7 +20,7 @@ This repository builds on that work with:
 - A **two-stage ms-swift workflow** to fine-tune Qwen3-ASR-0.6B for hotword prompts, train a CTC branch, and export the checkpoint for vLLM.
 - **Robustness fixes and tests** for training, inference, and hotword retrieval, plus JSONL batch evaluation with corpus CER.
 
-The vLLM pipeline has been tested with the original author's 1.7B checkpoint and a locally trained 0.6B CTC checkpoint. The 0.6B recognition quality has not yet been established by a full evaluation.
+The vLLM pipeline has been tested with the original author's 1.7B checkpoint and our fine-tuned 0.6B CTC checkpoint. The 0.6B checkpoint is available on [ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword); its recognition quality has not yet been established by a full evaluation.
 
 ```mermaid
 flowchart LR
@@ -46,26 +46,36 @@ flowchart LR
 
 The locked deployment uses **Python 3.12, vLLM 0.23.0 and CUDA 12.9** on Linux x86-64. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use an NVIDIA GPU with a compatible driver.
 
+1. Clone the repository and download the [fine-tuned Qwen3-ASR-0.6B CTC model](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword) into `checkpoint/`:
+
 ```bash
 git clone --branch dev https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
 cd qwen3-asr-hotword-toolkit
-UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
-source .venv-uv/bin/activate
-```
-
-`uv.lock` pins the CUDA 12.9 vLLM and PyTorch wheels; `vllm023` remains an alias for `vllm`. The separate `.venv-uv` avoids changing an existing training environment. See the [vLLM 0.23 setup guide](docs/vllm_023.md) for offline installation and compatibility details.
-
-Download the [fine-tuned 0.6B CTC checkpoint on ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword):
-
-```bash
 uvx --from modelscope==1.37.0 modelscope download \
   --model wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword \
   --endpoint https://www.modelscope.ai --local_dir ./checkpoint
+```
 
+2. Install the locked runtime, server, and client dependencies:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
+```
+
+3. Start the service:
+
+```bash
 ./scripts/serve.sh
 ```
 
-The startup configuration is in `scripts/serve.sh`: GPU 0, port 8900, batching and memory limits are set there. The global vocabulary is empty by default. Set `HOTWORD_FILE="$PROJECT_DIR/train_hotwords.txt"` in the script to load a domain vocabulary, or supply words per request. The server checks the checkpoint and uses offline model loading. `ctc` and `ctc_rag` require a checkpoint with a CTC branch.
+4. In another terminal, transcribe an audio file:
+
+```bash
+.venv-uv/bin/python -m qwen3_asr_vllm.client transcribe \
+  --audio /path/to/audio.wav --hotword "广州" --hotword "康辉"
+```
+
+The checkpoint includes the trained CTC branch; no training is needed to run it. The server defaults to GPU 0 and port 8900, with an empty global vocabulary. Edit `GPU_ID`, `HOTWORD_FILE` and memory settings in `scripts/serve.sh` as needed, or pass hotwords with each request. `uv.lock` pins the vLLM and PyTorch wheels; see the [vLLM 0.23 setup guide](docs/vllm_023.md) for offline installation.
 
 The online server supports `--mode asr`, `--mode ctc`, and `--mode ctc_rag`. Uppercase Latin acronyms such as `GPU` also get a common Chinese letter-name reading for retrieval; add explicit aliases such as `Claude|克劳德` for other pronunciations. Selected, unambiguous explicit aliases are replaced literally in the final transcript; choose aliases carefully, since an alias may also occur with another meaning. Automatic acronym readings and fuzzy phonetic matches are retrieval-only. Blacklists suppress replacements conservatively.
 
