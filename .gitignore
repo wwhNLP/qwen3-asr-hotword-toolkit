@@ -8,3 +8,5 @@ dist/
 artifacts/
 ckpt/
 data/
+/checkpoint/
+/train_hotwords.txt
