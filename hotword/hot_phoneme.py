@@ -7,6 +7,7 @@
 
 
 import os
+import re
 import time
 import threading
 from typing import List, Tuple, Dict, Set, Optional, NamedTuple
@@ -19,6 +20,21 @@ from .algo_calc import fuzzy_substring_search_constrained
 
 # 使用统一的 logger（从 __init__.py 导入）
 from . import logger
+
+# Common Mandarin names for Latin letters. Restrict automatic expansion to
+# acronyms: ordinary English words need explicit pronunciation aliases.
+_LETTER_NAMES = dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", (
+    "诶", "比", "西", "迪", "伊", "艾弗", "吉", "艾尺", "爱", "杰", "开", "艾勒", "艾姆",
+    "恩", "欧", "皮", "丘", "阿尔", "艾斯", "提", "优", "维", "达布留", "艾克斯", "歪", "贼德")))
+_DIGIT_NAMES = dict(zip("0123456789", "零一二三四五六七八九"))
+
+
+def _acronym_reading(target):
+    if (not re.fullmatch(r"[A-Za-z0-9]{2,8}", target)
+            or not target[0].isupper()
+            or not (target.isupper() or any(c.isdigit() for c in target))):
+        return None
+    return "".join(_LETTER_NAMES.get(c, _DIGIT_NAMES.get(c, "")) for c in target.upper())
 
 
 class MatchResult(NamedTuple):
@@ -62,6 +78,7 @@ class PhonemeCorrector:
 
         self.hotwords: Dict[str, List[List[Phoneme]]] = {}
         self.blacklists: Dict[str, Set[str]] = {}
+        self.explicit_aliases = {}
         self.fast_rag = FastRAG(threshold=min(self.threshold, self.similar_threshold) - 0.1)
         self._lock = threading.Lock()
 
@@ -82,6 +99,7 @@ class PhonemeCorrector:
         
         new_hotwords: Dict[str, List[List[Phoneme]]] = {}
         new_blacklists: Dict[str, Set[str]] = {}
+        explicit_aliases = {}
         for line in lines:
             if '~~~' in line:
                 hotword_part, blacklist_part = line.split('~~~', 1)
@@ -92,6 +110,13 @@ class PhonemeCorrector:
             if not parts:
                 continue
             target = parts[0]
+            if len(parts) > 1:
+                explicit_aliases[target] = tuple(parts[1:])
+            else:
+                explicit_aliases.pop(target, None)
+            reading = _acronym_reading(target)
+            if reading and reading not in parts:
+                parts.append(reading)
             
             phoneme_lists = []
             for part in parts:
@@ -117,6 +142,7 @@ class PhonemeCorrector:
         with self._lock:
             self.hotwords = new_hotwords
             self.blacklists = new_blacklists
+            self.explicit_aliases = explicit_aliases
             self.fast_rag = FastRAG(threshold=min(self.threshold, self.similar_threshold) - 0.1)
             self.fast_rag.add_hotwords(new_hotwords)
             self._native_refiner = native_refiner

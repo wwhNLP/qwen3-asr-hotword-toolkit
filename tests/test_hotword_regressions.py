@@ -13,6 +13,17 @@ HAS_VLLM = importlib.util.find_spec("vllm") is not None
 
 @unittest.skipUnless(HAS_PINYIN, "pypinyin is required for hotword retrieval")
 class HotwordRetrievalTest(unittest.TestCase):
+    def test_latin_acronym_reading_and_explicit_alias(self):
+        from hotword import PhonemeCorrector
+
+        corrector = PhonemeCorrector(refiner="python")
+        corrector.update_hotwords("GPU\nK8s\nClaude|克劳德")
+        self.assertIn("GPU", {item[1] for item in corrector.correct("吉皮优").similars})
+        self.assertIn("Claude", {item[1] for item in corrector.correct("克劳德").similars})
+        self.assertIn("K8s", {item[1] for item in corrector.correct("开八艾斯").similars})
+        self.assertNotIn("GPU", corrector.explicit_aliases)
+        self.assertEqual(corrector.explicit_aliases["Claude"], ("克劳德",))
+
     def test_entry_phonemes_are_reused_across_different_vocabularies(self):
         from hotword import PhonemeCorrector
         from qwen3_asr_vllm.requests import RequestPhonemeCache
