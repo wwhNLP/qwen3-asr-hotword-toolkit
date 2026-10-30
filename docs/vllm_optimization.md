@@ -433,7 +433,7 @@ of supported 0.26 inference.
 | RPC and multimodal input | `LLM.collective_rpc`, `DictEmbeddingItems`, `MultiModalFieldConfig`, processor registration and MRoPE hooks remain available. Verify device context IDs through hashing, encoder-cache eviction, preemption, and error recovery. These are internal extension interfaces. |
 | Processor and checkpoint | The local 0.26 development environment imports this adapter and loads the completed 0.6B checkpoint's configuration/processor. CTC settings survive (`add_ctc_branch`, 8404 labels, 5 layers), and a hotword/audio prompt can be rendered. Full tensor loading and generation on exact 0.26.0 remain untested. |
 | Dependencies | v0.26.0 requires Transformers >=5.5.3 and quack-kernels >=0.4.0; the current inference extra pins Transformers 4.57.6 and quack-kernels 0.3.3. CUDA requirements also pin several newer kernels. The published source pins PyTorch 2.11.0, so a PyTorch upgrade is not inherently required from this project's current 0.22.1 environment. Use a separate environment and resolve a matching binary stack. |
-| Version guard | Runtime currently rejects every version except 0.22.1. Replace this with explicit tested releases only after the 0.26 regression matrix passes; changing the version string alone is insufficient. |
+| Version guard | At the time of this assessment the runtime accepted only 0.22.1. It now also accepts the separately tested 0.23.0; 0.26 remains rejected until its regression matrix passes. |
 | Training | Keep ms-swift/Transformers 4 training and export separate from Transformers 5 inference. The export/training code has not been validated under Transformers 5. |
 
 A practical migration sequence is: create an isolated exact-0.26.0 environment;

@@ -14,6 +14,16 @@ from .requests import (RequestPhonemeCache, RequestVocabularyCache, hotword_targ
 from utils.asr_metrics import transcript_text
 
 
+SUPPORTED_VLLM_VERSIONS = ("0.22.1", "0.23.0")
+
+
+def _validate_vllm_version():
+    installed = version("vllm")
+    if installed.split("+", 1)[0] not in SUPPORTED_VLLM_VERSIONS:
+        supported = ", ".join(SUPPORTED_VLLM_VERSIONS)
+        raise RuntimeError(f"This adapter requires vLLM {supported}; found {installed}.")
+
+
 def select_hotwords(result, max_hotwords):
     ordered = dict.fromkeys(
         hotword for _, hotword, _ in list(result.matches) + list(result.similars)
@@ -39,7 +49,7 @@ class VLLMContextASR:
 
     Calls are serialized because preparation RPC and generation share one
     engine. transcribe_batch batches encoding, CTC and final decoding.
-    This adapter targets vLLM 0.22.1 and an unquantized, merged checkpoint.
+    This adapter targets vLLM 0.22.1/0.23.0 and an unquantized, merged checkpoint.
     """
 
     def __init__(
@@ -74,8 +84,7 @@ class VLLMContextASR:
         request_cache = RequestVocabularyCache(max_entries=request_cache_size)
         if not 0 <= rag_threshold <= 1:
             raise ValueError("rag_threshold must be between 0 and 1.")
-        if version("vllm").split("+")[0] != "0.22.1":
-            raise RuntimeError("This adapter requires vllm==0.22.1 (CUDA build suffixes are supported).")
+        _validate_vllm_version()
         for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size"):
             if engine_kwargs.get(name, 1) != 1:
                 raise ValueError("The context adapter currently supports one vLLM worker/GPU.")

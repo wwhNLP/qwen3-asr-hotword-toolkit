@@ -1,14 +1,25 @@
 import unittest
 from threading import Lock, Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
-from qwen3_asr_vllm.runtime import VLLMContextASR, select_hotwords
+from qwen3_asr_vllm.runtime import VLLMContextASR, select_hotwords, _validate_vllm_version
 from qwen3_asr_vllm.requests import RequestPhonemeCache, RequestVocabularyCache
 from qwen3_asr_vllm.transport import EmbeddingCache, pack_embeddings, unpack_embeddings
+
+
+class VLLMVersionTest(unittest.TestCase):
+    def test_supported_releases_accept_cuda_suffixes_and_reject_untested_versions(self):
+        for installed in ("0.22.1", "0.22.1+cu129", "0.23.0", "0.23.0+cu129"):
+            with self.subTest(installed=installed), patch("qwen3_asr_vllm.runtime.version", return_value=installed):
+                _validate_vllm_version()
+        for installed in ("0.22.0", "0.23.1", "0.23.0rc1", "0.26.0"):
+            with self.subTest(installed=installed), patch("qwen3_asr_vllm.runtime.version", return_value=installed):
+                with self.assertRaisesRegex(RuntimeError, "0.22.1, 0.23.0"):
+                    _validate_vllm_version()
 
 
 class HotwordSelectionTest(unittest.TestCase):
