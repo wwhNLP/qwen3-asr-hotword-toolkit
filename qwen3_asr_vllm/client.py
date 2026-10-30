@@ -19,6 +19,37 @@ DEFAULT_CONCURRENCY = 4
 DEFAULT_MAX_NEW_TOKENS = None  # None uses the server setting.
 
 
+def _chunk_boundaries(source, frames_per_chunk):
+    """Prefer a 200 ms quiet interval near the limit; never exceed the limit."""
+    import numpy as np
+
+    rate = source.samplerate
+    block = max(1, int(rate * 0.02))
+    quiet_blocks = max(1, int(np.ceil(rate * 0.2 / block)))
+    lookback = min(int(rate * 3), frames_per_chunk // 5)
+    boundaries = []
+    start = 0
+    while start < len(source):
+        end = min(start + frames_per_chunk, len(source))
+        if end < len(source) and lookback >= quiet_blocks * block:
+            source.seek(end - lookback)
+            tail = source.read(lookback, dtype="float32", always_2d=True)
+            usable = len(tail) // block * block
+            energy = np.mean(tail[:usable].reshape(-1, block, tail.shape[1]) ** 2, axis=(1, 2))
+            quiet = energy < 0.01 ** 2
+            run = 0
+            last = None
+            for index, is_quiet in enumerate(quiet):
+                run = run + 1 if is_quiet else 0
+                if run >= quiet_blocks:
+                    last = index
+            if last is not None:
+                end = end - lookback + (last + 1 - quiet_blocks // 2) * block
+        boundaries.append((start, end))
+        start = end
+    return boundaries
+
+
 class ASRClient:
     def __init__(self, url=DEFAULT_URL, *, timeout=120, trust_env=False):
         self._client = httpx.Client(base_url=url.rstrip("/"), timeout=timeout, trust_env=trust_env)
@@ -68,15 +99,16 @@ class ASRClient:
                 raise ValueError("chunk_seconds is shorter than one audio frame.")
             if len(source) <= frames_per_chunk:
                 return self.transcribe(audio, **options)
+            boundaries = _chunk_boundaries(source, frames_per_chunk)
 
             def chunks():
-                while source.tell() < len(source):
-                    start = source.tell()
-                    frames = source.read(frames_per_chunk, dtype="float32", always_2d=True)
+                for start, end in boundaries:
+                    source.seek(start)
+                    frames = source.read(end - start, dtype="float32", always_2d=True)
                     encoded = io.BytesIO()
                     sf.write(encoded, frames, source.samplerate, format="WAV", subtype="PCM_16")
                     encoded.seek(0)
-                    yield start / source.samplerate, source.tell() / source.samplerate, encoded
+                    yield start / source.samplerate, end / source.samplerate, encoded
 
             def send(chunk):
                 start, end, encoded = chunk
@@ -85,7 +117,7 @@ class ASRClient:
 
             # Limit memory and outstanding requests to one group of segments.
             segments = []
-            total = (len(source) + frames_per_chunk - 1) // frames_per_chunk
+            total = len(boundaries)
             iterator = chunks()
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 while group := list(islice(iterator, concurrency)):
@@ -96,6 +128,7 @@ class ASRClient:
                 "text": "".join(segment["text"] for segment in segments),
                 "rough": "".join(segment.get("rough", "") for segment in segments),
                 "hotwords": list(dict.fromkeys(word for segment in segments for word in segment.get("hotwords", []))),
+                "truncated": any(segment.get("truncated", False) for segment in segments),
                 "segments": segments}
 
     def transcribe_many(self, audios, *, hotwords=None, max_ctx_hotwords=None,
@@ -128,6 +161,11 @@ class ASRClient:
         response.raise_for_status()
         return response.json()
 
+    def metrics(self):
+        response = self._client.get("/v1/metrics")
+        response.raise_for_status()
+        return response.json()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Client for Qwen3-ASR CTC+RAG service.")
@@ -153,6 +191,7 @@ def main():
     update.add_argument("--file", required=True)
     commands.add_parser("hotword-info", help="Show global vocabulary version and size")
     commands.add_parser("batching-info", help="Show current batching statistics")
+    commands.add_parser("metrics", help="Show transcription and hotword counters")
     args = parser.parse_args(sys.argv[1:] or ["transcribe"])
     with ASRClient(args.url, timeout=args.timeout, trust_env=args.use_env_proxy) as client:
         if args.command in {"transcribe", "transcribe-many"}:
@@ -177,8 +216,10 @@ def main():
             result = client.replace_hotwords(args.file)
         elif args.command == "hotword-info":
             result = client.hotword_info()
-        else:
+        elif args.command == "batching-info":
             result = client.batching_info()
+        else:
+            result = client.metrics()
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

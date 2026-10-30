@@ -80,6 +80,26 @@ class ClientTest(unittest.TestCase):
             self.assertEqual(result["hotwords"], ["词"])
             self.assertEqual(progress, [(2, 3), (3, 3)])
 
+    def test_long_audio_prefers_quiet_boundary_and_propagates_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "long.wav"
+            samples = np.full(4500, 0.2, dtype=np.float32)
+            samples[1600:1900] = 0
+            sf.write(path, samples, 1000)
+            with patch.object(self.client, "_transcribe_stream", return_value={
+                "mode": "ctc_rag", "text": "x", "truncated": True
+            }):
+                result = self.client.transcribe_audio(path, chunk_seconds=2)
+            segments = result["segments"]
+            self.assertGreaterEqual(segments[0]["end"], 1.6)
+            self.assertLessEqual(segments[0]["end"], 1.9)
+            self.assertEqual(segments[0]["start"], 0)
+            self.assertEqual(segments[-1]["end"], 4.5)
+            for left, right in zip(segments, segments[1:]):
+                self.assertEqual(left["end"], right["start"])
+            self.assertTrue(all(s["end"] - s["start"] <= 2 for s in segments))
+            self.assertTrue(result["truncated"])
+
     def test_no_arguments_uses_configured_defaults(self):
         with patch("sys.argv", ["client.py"]), patch("sys.stdout", new_callable=io.StringIO), \
              patch("qwen3_asr_vllm.client.ASRClient") as client_class:

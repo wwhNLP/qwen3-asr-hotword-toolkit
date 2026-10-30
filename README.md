@@ -55,18 +55,21 @@ source .venv-uv/bin/activate
 
 `uv.lock` pins the CUDA 12.9 vLLM and PyTorch wheels; `vllm023` remains an alias for `vllm`. The separate `.venv-uv` avoids changing an existing training environment. See the [vLLM 0.23 setup guide](docs/vllm_023.md) for offline installation and compatibility details.
 
-Download the [fine-tuned 0.6B CTC checkpoint on ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword) and prepare a UTF-8 vocabulary at `train_hotwords.txt`:
+Download the [fine-tuned 0.6B CTC checkpoint on ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword):
 
 ```bash
 uvx --from modelscope==1.37.0 modelscope download \
   --model wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword \
   --endpoint https://www.modelscope.ai --local_dir ./checkpoint
 
-cp /path/to/your-hotwords.txt train_hotwords.txt
 ./scripts/serve.sh
 ```
 
-The startup configuration is in `scripts/serve.sh`: model and vocabulary paths are project-relative, and GPU 0, port 8900, batching and memory limits are explicitly set there. It checks the checkpoint before starting and uses offline model loading. The included `hotword/hot.txt` is an example; replace it with vocabulary relevant to your audio. `ctc` and `ctc_rag` require a checkpoint with a CTC branch.
+The startup configuration is in `scripts/serve.sh`: GPU 0, port 8900, batching and memory limits are set there. The global vocabulary is empty by default. Set `HOTWORD_FILE="$PROJECT_DIR/train_hotwords.txt"` in the script to load a domain vocabulary, or supply words per request. The server checks the checkpoint and uses offline model loading. `ctc` and `ctc_rag` require a checkpoint with a CTC branch.
+
+The online server supports `--mode asr`, `--mode ctc`, and `--mode ctc_rag`. Uppercase Latin acronyms such as `GPU` also get a common Chinese letter-name reading for retrieval; add explicit aliases such as `Claude|克劳德` for other pronunciations. Selected, unambiguous explicit aliases are replaced literally in the final transcript; choose aliases carefully, since an alias may also occur with another meaning. Automatic acronym readings and fuzzy phonetic matches are retrieval-only. Blacklists suppress replacements conservatively.
+
+Responses report the number of injected words, literal hits and alias replacements. `/v1/metrics` aggregates those counts, successful requests and length-truncated results for the current server process. A literal hit only means that the word appears in the output; it does not establish correctness. For long audio, the client seeks a nearby quiet interval before each maximum-length boundary and reports `truncated` if any segment reaches the decoder limit. Continuous speech still falls back to fixed boundaries.
 
 For a JSONL batch, each record needs one audio path. An optional assistant message supplies the reference for CER. Individual records can provide a vocabulary and inference limits:
 
@@ -81,7 +84,7 @@ CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
   --hot-txt /path/to/hotwords.txt --batch-size 8 --out-json results.jsonl
 ```
 
-In `ctc_rag` mode, request `hotwords` replace the default `--hot-txt` vocabulary for that audio; retrieval selects up to `max_ctx_hotwords` matches. Omit the field or use `null` for the default vocabulary, and use `[]` to disable hotwords for that audio. The same fields can be supplied from Python:
+In `ctc_rag` mode, request `hotwords` replace the default `--hot-txt` vocabulary for that audio; retrieval selects up to `max_ctx_hotwords` matches. For a request containing at most four entries, remaining slots are filled with explicitly supplied words without blacklists, even when CTC misses them. Use a focused list to avoid irrelevant prompts. Omit the field or use `null` for the default vocabulary, and use `[]` to disable hotwords for that audio. The same fields can be supplied from Python:
 
 ```python
 from qwen3_asr_vllm.runtime import VLLMContextASR
