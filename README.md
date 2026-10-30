@@ -44,30 +44,29 @@ flowchart LR
 
 ## 🚀 Quick start
 
-Use a separate Python 3.10+ GPU environment. The adapter supports **vLLM 0.22.1 or 0.23.0** with **Transformers 4.57.6**. Select CUDA-compatible vLLM and PyTorch builds for your system.
+The locked deployment uses **Python 3.12, vLLM 0.23.0 and CUDA 12.9** on Linux x86-64. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use an NVIDIA GPU with a compatible driver.
 
 ```bash
-git clone https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
+git clone --branch dev https://github.com/wwhNLP/qwen3-asr-hotword-toolkit.git
 cd qwen3-asr-hotword-toolkit
-python -m pip install -e '.[vllm]'
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
+source .venv-uv/bin/activate
 ```
 
-The `vllm` extra installs 0.22.1. For 0.23.0, use `.[vllm023]` in a separate environment; follow the [0.23 setup and validation guide](docs/vllm_023.md) to select the correct CUDA wheel.
+`uv.lock` pins the CUDA 12.9 vLLM and PyTorch wheels; `vllm023` remains an alias for `vllm`. The separate `.venv-uv` avoids changing an existing training environment. See the [vLLM 0.23 setup guide](docs/vllm_023.md) for offline installation and compatibility details.
 
-Download a checkpoint with a trained CTC branch, such as the original author's [1.7B hotword model](https://huggingface.co/habagou/qwen3-asr-hotword-1.7B-ctc):
+Download the [fine-tuned 0.6B CTC checkpoint on ModelScope](https://www.modelscope.ai/models/wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword) and prepare a UTF-8 vocabulary at `train_hotwords.txt`:
 
 ```bash
-hf download habagou/qwen3-asr-hotword-1.7B-ctc \
-  --local-dir ./ckpt/qwen3-asr-hotword-1.7B-ctc
+uvx --from modelscope==1.37.0 modelscope download \
+  --model wwhnlp/Qwen3-ASR-0.6B-CTC-Hotword \
+  --endpoint https://www.modelscope.ai --local_dir ./checkpoint
 
-CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
-  --model ./ckpt/qwen3-asr-hotword-1.7B-ctc \
-  --audio /path/to/audio.wav \
-  --mode ctc_rag --hot-txt /path/to/hotwords.txt \
-  --verify-encoder-reuse
+cp /path/to/your-hotwords.txt train_hotwords.txt
+./scripts/serve.sh
 ```
 
-`ctc` and `ctc_rag` require a checkpoint with a CTC branch. The included `hotword/hot.txt` is an example; replace it with a list relevant to your audio. `--verify-encoder-reuse` checks that each audio segment is encoded once.
+The startup configuration is in `scripts/serve.sh`: model and vocabulary paths are project-relative, and GPU 0, port 8900, batching and memory limits are explicitly set there. It checks the checkpoint before starting and uses offline model loading. The included `hotword/hot.txt` is an example; replace it with vocabulary relevant to your audio. `ctc` and `ctc_rag` require a checkpoint with a CTC branch.
 
 For a JSONL batch, each record needs one audio path. An optional assistant message supplies the reference for CER. Individual records can provide a vocabulary and inference limits:
 
@@ -77,7 +76,7 @@ For a JSONL batch, each record needs one audio path. An optional assistant messa
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python infer_vllm.py \
-  --model ./ckpt/qwen3-asr-hotword-1.7B-ctc \
+  --model ./checkpoint \
   --test-json /path/to/test.jsonl --mode ctc_rag \
   --hot-txt /path/to/hotwords.txt --batch-size 8 --out-json results.jsonl
 ```
@@ -134,7 +133,7 @@ Hotword coarse scoring uses up to four native CPU workers (`--rag-workers 4`), i
 
 Weighted refinement uses Numba when available (`--rag-refiner auto`, the default). Vocabulary loading prepares the compiled kernel before inference. Select `python` or `numba` explicitly for comparisons. The vLLM extra includes Numba; standalone hotword users can install `.[rag-native]`.
 
-See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. Supported inference releases are **vLLM 0.22.1 and 0.23.0**.
+See the [latency measurements and vLLM 0.26 migration assessment](docs/vllm_optimization.md) for validation, limits, and a repeatable benchmark. The locked deployment targets **vLLM 0.23.0**; 0.22.1 results are historical.
 
 ## 🙏 Credits and license
 

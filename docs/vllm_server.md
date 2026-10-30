@@ -2,16 +2,27 @@
 
 The HTTP service keeps one `VLLMContextASR` engine loaded. It is a custom API,
 not a drop-in OpenAI-compatible `vllm serve` endpoint. Install the server
-extra in the same environment as one of the vLLM extras:
+extra with the locked vLLM 0.23 environment:
 
 ```bash
-python -m pip install -e '.[vllm023,server]'
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
 ```
 
-On a client machine without a GPU, install only `.[client]`.
+On a Linux x86-64 client machine without a GPU, sync only the `client` extra.
 
-For CUDA wheel selection see [vLLM 0.23 setup](vllm_023.md). For the
-validated local CUDA 12 environment, use the PyTorch sampler:
+For CUDA requirements see [vLLM 0.23 setup](vllm_023.md). Place the complete
+checkpoint under `checkpoint/` and the vocabulary at `train_hotwords.txt`,
+then start the fixed configuration:
+
+```bash
+./scripts/serve.sh
+```
+
+Edit `scripts/serve.sh` to change the paths, GPU, port and batching settings.
+It supports single-file and sharded Safetensors checkpoints and rejects missing
+model files before Transformers can mistake a path for a Hub repository. It
+uses offline model loading. For custom arguments, activate `.venv-uv` and use
+the underlying server directly:
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 VLLM_USE_FLASHINFER_SAMPLER=0 \

@@ -1,31 +1,40 @@
 # vLLM 0.23.0: setup and CTC+RAG inference
 
-Use a separate Python 3.10+ environment. The project offers `.[vllm]` for
-vLLM 0.22.1 and `.[vllm023]` for 0.23.0; install one of these alternatives.
-Both pin Transformers 4.57.6. vLLM 0.23 still accepts Transformers 4, although
-it logs a deprecation warning. Releases beyond 0.23.0 are not enabled here.
+The locked deployment targets Linux x86-64, Python 3.12, vLLM 0.23.0+cu129,
+PyTorch 2.11.0+cu129 and Transformers 4.57.6. The `vllm` and `vllm023` extras
+select the same stack. vLLM 0.23 logs a Transformers 4 deprecation warning.
 
-Select a vLLM wheel matching your platform and CUDA stack. For example, on
-Linux x86-64, the official CUDA 12.9 wheel can be installed before the extra:
+Install with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
-python -m pip install \
-  'https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl' \
-  --extra-index-url https://download.pytorch.org/whl/cu129
-python -m pip install -e '.[vllm023]'
+UV_PROJECT_ENVIRONMENT=.venv-uv uv sync --locked --extra vllm --extra server --extra client
+source .venv-uv/bin/activate
 ```
 
-This is an installation recipe, not a validation of every CUDA and driver
-combination. The `vllm023` extra pins cuDNN frontend to 1.19.1 to avoid
-newer frontend dependencies conflicting with the 0.23.0 CUDA requirements.
+The `.python-version` and `uv.lock` fix the interpreter series and dependency
+versions. `tool.uv.sources` selects the official CUDA 12.9 vLLM wheel and
+PyTorch index. Do not use plain pip for this lock: it does not apply uv's wheel
+sources. The project pins cuDNN frontend 1.19.1 and xgrammar 0.2.3 for the
+vLLM 0.23 dependency constraints and Python 3.12 wheel availability.
 
-The PyPI 0.23 wheel encountered during testing links CUDA 13; it cannot be
-loaded with the local CUDA 12 runtime. The local A800 validation instead uses
-vLLM 0.23.0+cu129, PyTorch 2.11.0+cu128, Transformers 4.57.6 and NVIDIA driver
-570.148.08. That mixed CUDA-minor combination was tested on this machine; choose
-appropriate supported binaries for a different system. See the official
+The PyPI 0.23 wheel encountered during testing links CUDA 13. The lock uses the
+official CUDA 12.9 build; the NVIDIA driver must support the selected CUDA
+stack. Earlier A800 tests used vLLM 0.23.0+cu129 and PyTorch 2.11.0+cu128 with
+driver 570.148.08; they do not establish compatibility for every system. See the official
 [0.23 GPU installation guide](https://docs.vllm.ai/en/v0.23.0/getting_started/installation/gpu/)
 and [release requirements](https://github.com/vllm-project/vllm/blob/v0.23.0/requirements/cuda.txt).
+
+`uv sync` needs access to the configured indexes and wheel URL unless the uv
+cache is already populated. On an offline machine, prepare the matching Linux
+x86-64/Python 3.12 dependencies in a uv cache on a connected machine and
+transfer that cache. With Python 3.12 installed, run:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-uv UV_CACHE_DIR=/path/to/cache \
+  uv sync --offline --locked --extra vllm --extra server --extra client
+```
+
+Copy the checkpoint and hotword file separately.
 
 ## Transcribe one audio file
 
