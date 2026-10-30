@@ -36,7 +36,8 @@ def read_audio(path):
     from math import gcd
     from scipy.signal import resample_poly
 
-    waveform, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
+    source = path if hasattr(path, "read") else str(path)
+    waveform, sample_rate = sf.read(source, dtype="float32", always_2d=True)
     waveform = waveform.mean(axis=1)
     if sample_rate != 16000:
         divisor = gcd(sample_rate, 16000)
@@ -135,6 +136,8 @@ class VLLMContextASR:
             stop_token_ids=[151643, 151645],
         )
         self._lock = Lock()
+        self._hotword_update_lock = Lock()
+        self._hotword_version = 1
         self.llm.collective_rpc(
             "context_configure",
             args=(
@@ -146,6 +149,28 @@ class VLLMContextASR:
                 },
             )
         )
+
+    def update_hotwords(self, hotword_text):
+        """Build a replacement vocabulary and swap it between inference calls."""
+        if self.mode != "ctc_rag":
+            raise ValueError("A global vocabulary requires ctc_rag mode.")
+        if not isinstance(hotword_text, str):
+            raise ValueError("hotword_text must be a string.")
+        from hotword import PhonemeCorrector
+
+        # Serialize updates, but leave inference free to use the old corrector
+        # while the replacement's phoneme index is constructed.
+        with self._hotword_update_lock:
+            corrector = PhonemeCorrector(threshold=self.rag_threshold, refiner=self.rag_refiner)
+            corrector.update_hotwords(hotword_text)
+            with self._lock:
+                self._corrector = corrector
+                self._hotword_version += 1
+                return {"version": self._hotword_version, "size": len(corrector.hotwords)}
+
+    def hotword_info(self):
+        with self._lock:
+            return {"version": self._hotword_version, "size": len(self._corrector.hotwords)}
 
     def transcribe(self, audio, *, hotwords=None, max_ctx_hotwords=None, max_new_tokens=None):
         options = {"max_ctx_hotwords": max_ctx_hotwords, "max_new_tokens": max_new_tokens}
