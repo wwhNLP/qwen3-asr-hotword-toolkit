@@ -8,6 +8,7 @@ Transformers inference model is loaded.
 
 import copy
 from collections.abc import Mapping
+from itertools import accumulate
 
 import torch
 from torch import nn
@@ -116,8 +117,9 @@ class VLLMCTCBranch(nn.Module):
         self.blank_id = config.ctc_blank_id
         self.vocab_size = config.ctc_vocab_size
 
-    def forward(self, hidden_states, cu_seqlens):
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+    def forward(self, hidden_states, cu_seqlens, max_seqlen=None):
+        if max_seqlen is None:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         for layer in self.layers:
             hidden_states = layer(hidden_states, cu_seqlens, max_seqlen)
         return self.ctc_head(self.norm(hidden_states))
@@ -241,8 +243,12 @@ class Qwen3ASRContextForConditionalGeneration(Qwen3ASRForConditionalGeneration):
                 if self.ctc_branch is None or self._context_vocab is None:
                     raise RuntimeError("CTC resources were not configured on the vLLM worker.")
                 # Sequence boundaries prevent CTC attention crossing utterances.
-                cu_seqlens = torch.tensor([0, *output_lengths], device=device, dtype=torch.int32).cumsum(0, dtype=torch.int32)
-                logits = self.ctc_branch(torch.cat(embeddings, dim=0), cu_seqlens)
+                cu_seqlens = torch.tensor(list(accumulate([0, *output_lengths])), device=device, dtype=torch.int32)
+                # vLLM's attention wrapper calls max_seqlen.item() per layer.
+                # The length is already known on the CPU; keeping this scalar
+                # there avoids a GPU synchronization for each CTC layer.
+                max_seqlen = torch.tensor(max(output_lengths), dtype=torch.int32, device="cpu")
+                logits = self.ctc_branch(torch.cat(embeddings, dim=0), cu_seqlens, max_seqlen)
                 self._ctc_forward_calls += 1
                 frame_ids = logits.argmax(-1).cpu().tolist()
                 offset = 0
