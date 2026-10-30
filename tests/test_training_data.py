@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import wave
 
 from training.prepare_aishell import (
@@ -88,6 +89,28 @@ class AISHELLPreparationTest(unittest.TestCase):
         (self.seaco / "data" / "test" / "uttid").write_text("missing\n")
         with self.assertRaisesRegex(ValueError, "Missing test SeACo IDs"):
             self.run_prepare()
+
+    def test_empty_seaco_id_list_is_rejected(self):
+        (self.seaco / "data" / "dev" / "uttid").write_text("\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Empty dev SeACo ID list"):
+            self.run_prepare()
+
+    def test_zero_distractors_does_not_sample_negative_words(self):
+        lexicon = ["北京", "清华", "上海"]
+        with patch("random.Random.sample", side_effect=AssertionError("unexpected negative sampling")):
+            words = sample_hotwords({"uttid": "a", "text": "北京欢迎你"}, lexicon,
+                                    LexiconMatcher(lexicon), empty_ratio=0,
+                                    negative_ratio=1, distractors=0)
+        self.assertEqual(words, [])
+
+    def test_export_rejects_an_existing_output_file(self):
+        from training.export_checkpoint import export
+
+        output = self.root / "existing-file"
+        output.write_text("untouched", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "empty directory"):
+            export(str(self.root / "source"), str(output))
+        self.assertEqual(output.read_text(encoding="utf-8"), "untouched")
 
     def test_negative_only_sampling_excludes_words_in_reference(self):
         lexicon = ["北京", "清华", "上海"]

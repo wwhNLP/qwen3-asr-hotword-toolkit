@@ -13,7 +13,8 @@ from utils.paraformer_vocab import ParaformerVocab
 
 def export(checkpoint: str, output: str, require_ctc: bool = True):
     source, destination = Path(checkpoint).resolve(), Path(output).resolve()
-    if source == destination or (destination.exists() and any(destination.iterdir())):
+    if source == destination or (destination.exists()
+                                 and (not destination.is_dir() or any(destination.iterdir()))):
         raise ValueError("Export to an empty directory different from the training checkpoint.")
     if (source / "adapter_config.json").exists():
         raise ValueError("Merge LoRA adapters into full weights before exporting.")
